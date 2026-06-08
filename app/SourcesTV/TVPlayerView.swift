@@ -20,6 +20,9 @@ struct TVPlayerView: View {
     @State private var isPaused = false
     @State private var currentTime = 0.0
     @State private var duration = 0.0
+    @State private var videoHeight = 0          // metadata line: encoded height (2160 -> "4K")
+    @State private var audioCodec = ""          // metadata line: active audio codec (e.g. "eac3")
+    @State private var isHDR = false            // metadata line: HDR/DV detected (sig-peak > 1)
     @State private var resumeSeconds: Double? = nil   // nil until fetched; applied once duration known
     @State private var appliedResume = false
     @State private var lastSaved = -1.0               // last position persisted (throttle)
@@ -39,7 +42,7 @@ struct TVPlayerView: View {
     @State private var curMeta: PlaybackMeta?
 
     /// Which on-screen control (or the video surface) currently has remote focus.
-    private enum Focus: Hashable { case player, back, play, fwd, audio, subs, prev, next, episodes }
+    private enum Focus: Hashable { case player, close, back, play, fwd, audio, subs, prev, next, episodes }
     @FocusState private var focus: Focus?
     private let plog = Logger(subsystem: "com.stremiox.app", category: "tvplayer")
 
@@ -76,9 +79,14 @@ struct TVPlayerView: View {
                                 core.markPlaybackWatched(m)
                             }
                         }
+                    case MPVProperty.videoParamsSigPeak:
+                        if let p = data as? Double { isHDR = p > 1.0 }
                     case MPVProperty.duration:
                         if let d = data as? Double { duration = d; maybeResume() }
-                    case MPVProperty.trackList: refreshTracks()
+                    case MPVProperty.trackList:
+                        refreshTracks()
+                        let s = coordinator.player?.mediaSummary()
+                        videoHeight = s?.height ?? 0; audioCodec = s?.audioCodec ?? ""
                     case MPVProperty.endFileError:
                         loadTimeout?.cancel()
                         if !hasStartedPlaying { loadErrorMsg = (data as? String) ?? ""; withAnimation { loadFailed = true } }
@@ -139,46 +147,121 @@ struct TVPlayerView: View {
 
     // MARK: - Control bar
 
+    /// Resolution / HDR / audio summary under the title, read live from mpv.
+    private var metadataLine: String {
+        var parts: [String] = []
+        switch videoHeight {
+        case 2000...:     parts.append("4K")
+        case 1300..<2000: parts.append("1440p")
+        case 900..<1300:  parts.append("1080p")
+        case 600..<900:   parts.append("720p")
+        case 1..<600:     parts.append("\(videoHeight)p")
+        default:          break
+        }
+        if isHDR { parts.append("HDR") }
+        if !audioCodec.isEmpty { parts.append(audioLabel(audioCodec)) }
+        return parts.joined(separator: "  ·  ")
+    }
+
+    private func audioLabel(_ c: String) -> String {
+        switch c.lowercased() {
+        case "eac3":               return "EAC3"
+        case "ac3":                return "AC3"
+        case "truehd":             return "TrueHD"
+        case "dts", "dts-hd", "dca": return "DTS"
+        case "aac":                return "AAC"
+        case "flac":               return "FLAC"
+        case "opus":               return "Opus"
+        case "mp3":                return "MP3"
+        default:                   return c.uppercased()
+        }
+    }
+
     private var controlBar: some View {
-        VStack(alignment: .leading, spacing: Theme.Space.md) {
-            if !curTitle.isEmpty {
-                Text(curTitle).font(Theme.Typography.cardTitle).foregroundStyle(Theme.Palette.textPrimary).lineLimit(1)
-            }
-            HStack(spacing: Theme.Space.sm) {
-                Text(timeString(currentTime)).font(.callout.monospacedDigit()).foregroundStyle(Theme.Palette.textPrimary)
-                ProgressView(value: duration > 0 ? min(1, currentTime / duration) : 0).tint(Theme.Palette.accent)
-                Text(timeString(duration)).font(.callout.monospacedDigit()).foregroundStyle(Theme.Palette.textSecondary)
-            }
-            HStack(spacing: 16) {
-                barButton(.back, "gobackward.10", "−10s") { seek(-10) }
-                barButton(.play, isPaused ? "play.fill" : "pause.fill", isPaused ? "Play" : "Pause") { toggle() }
-                barButton(.fwd, "goforward.10", "+10s") { seek(10) }
-                Spacer(minLength: 24)
-                if !audioTracks.isEmpty { barButton(.audio, "waveform", "Audio") { openPanel() } }
-                barButton(.subs, "captions.bubble", "Subtitles") { openPanel() }
-                if episodes.count > 1 {
-                    if hasPrevEpisode { barButton(.prev, "backward.end.fill", "Previous") { playPrevious() } }
-                    if hasNextEpisode { barButton(.next, "forward.end.fill", "Next") { playNext() } }
-                    barButton(.episodes, "list.bullet", "Episodes") { openPanel() }
+        VStack(spacing: 0) {
+            // Top chrome: back + title + live metadata
+            HStack(alignment: .top, spacing: Theme.Space.lg) {
+                ctrlButton(.close, "chevron.left") { saveProgress(at: currentTime); dismiss() }
+                Spacer(minLength: Theme.Space.lg)
+                VStack(alignment: .trailing, spacing: 6) {
+                    if !curTitle.isEmpty {
+                        Text(curTitle).font(Theme.Typography.sectionTitle)
+                            .foregroundStyle(Theme.Palette.textPrimary).lineLimit(1)
+                    }
+                    if !metadataLine.isEmpty {
+                        Text(metadataLine).font(Theme.Typography.label)
+                            .foregroundStyle(Theme.Palette.textSecondary)
+                    }
                 }
             }
+            .padding(.horizontal, 60).padding(.top, 50)
+            .background(LinearGradient(colors: [.black.opacity(0.6), .clear], startPoint: .top, endPoint: .bottom))
+
+            Spacer()
+
+            // Bottom: scrubber + centered transport with trailing audio/subs/episodes
+            VStack(spacing: Theme.Space.lg) {
+                HStack(spacing: Theme.Space.md) {
+                    Text(timeString(currentTime)).font(.callout.monospacedDigit())
+                        .foregroundStyle(Theme.Palette.textPrimary)
+                    scrubber
+                    Text(timeString(duration)).font(.callout.monospacedDigit())
+                        .foregroundStyle(Theme.Palette.textSecondary)
+                }
+                ZStack {
+                    HStack(spacing: Theme.Space.md) {
+                        ctrlButton(.back, "gobackward.10") { seek(-10) }
+                        if episodes.count > 1 && hasPrevEpisode { ctrlButton(.prev, "backward.end.fill") { playPrevious() } }
+                        ctrlButton(.play, isPaused ? "play.fill" : "pause.fill", big: true) { toggle() }
+                        if episodes.count > 1 && hasNextEpisode { ctrlButton(.next, "forward.end.fill") { playNext() } }
+                        ctrlButton(.fwd, "goforward.10") { seek(10) }
+                    }
+                    HStack(spacing: Theme.Space.md) {
+                        if !audioTracks.isEmpty { ctrlButton(.audio, "waveform") { openPanel() } }
+                        ctrlButton(.subs, "captions.bubble") { openPanel() }
+                        if episodes.count > 1 { ctrlButton(.episodes, "list.bullet") { openPanel() } }
+                    }
+                    .frame(maxWidth: .infinity, alignment: .trailing)
+                }
+            }
+            .padding(.horizontal, 60).padding(.bottom, 50)
+            .background(LinearGradient(colors: [.clear, .black.opacity(0.9)], startPoint: .top, endPoint: .bottom))
         }
-        .padding(40)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .background(LinearGradient(colors: [.clear, .black.opacity(0.85)], startPoint: .top, endPoint: .bottom))
         .transition(.opacity)
     }
 
-    private func barButton(_ f: Focus, _ icon: String, _ label: String, action: @escaping () -> Void) -> some View {
-        Button { action(); flashControls() } label: {
-            VStack(spacing: 5) {
-                Image(systemName: icon).font(.system(size: 26, weight: .semibold))
-                Text(label).font(.caption2)
+    /// Slim ember seek bar with a knob. Position display; seeking is via the ±10 controls / remote.
+    private var scrubber: some View {
+        GeometryReader { geo in
+            let frac = duration > 0 ? min(1, max(0, currentTime / duration)) : 0
+            let w = geo.size.width
+            ZStack(alignment: .leading) {
+                Capsule().fill(Theme.Palette.textPrimary.opacity(0.22)).frame(height: 6)
+                Capsule().fill(Theme.Palette.accent).frame(width: max(0, w * frac), height: 6)
+                Circle().fill(Theme.Palette.accent).frame(width: 18, height: 18)
+                    .shadow(color: Theme.Palette.accent.opacity(0.6), radius: 6)
+                    .offset(x: max(0, w * frac - 9))
             }
-            .frame(width: 100, height: 80)
+            .frame(maxHeight: .infinity, alignment: .center)
         }
-        .buttonStyle(.card)
+        .frame(height: 18)
+    }
+
+    /// Circular, focus-reactive control. Focused → ember fill + lift; the play button is larger.
+    private func ctrlButton(_ f: Focus, _ icon: String, big: Bool = false, action: @escaping () -> Void) -> some View {
+        let focused = (focus == f)
+        let d: CGFloat = big ? 92 : 64
+        return Button { action(); flashControls() } label: {
+            Image(systemName: icon)
+                .font(.system(size: big ? 38 : 26, weight: .semibold))
+                .foregroundStyle(focused ? Theme.Palette.canvas : Theme.Palette.textPrimary)
+                .frame(width: d, height: d)
+                .background(Circle().fill(focused ? Theme.Palette.accent : Theme.Palette.textPrimary.opacity(0.12)))
+                .scaleEffect(focused ? 1.12 : 1.0)
+        }
+        .buttonStyle(.plain)
         .focused($focus, equals: f)
+        .animation(.easeOut(duration: 0.18), value: focused)
     }
 
     // MARK: - Options panel (audio / subtitles / episodes)
