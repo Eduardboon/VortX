@@ -341,6 +341,13 @@ final class MPVMetalViewController: UIViewController {
     func setAudioTrack(_ id: Int) { setString(MPVProperty.aid, id < 0 ? "no" : String(id)) }
     func setSubtitleTrack(_ id: Int) { setString(MPVProperty.sid, id < 0 ? "no" : String(id)) }
 
+    /// Current media summary for the player's metadata line: encoded video height (e.g. 2160) and the
+    /// active audio codec (e.g. "eac3"). Both can be 0/"" early in load, before the first frame.
+    func mediaSummary() -> (height: Int, audioCodec: String) {
+        guard mpv != nil else { return (0, "") }
+        return (getInt("video-params/h"), getString("audio-codec-name") ?? "")
+    }
+
     /// Persisted video-size mode, read at startup so the first frame already uses it.
     private(set) var videoSizeMode = UserDefaults.standard.string(forKey: "stremiox.videoSize") ?? "original"
 
