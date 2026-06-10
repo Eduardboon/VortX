@@ -34,6 +34,9 @@ struct ProfilePickerView: View {
                 }
             }
             .padding(Theme.Space.screenEdge)
+            // Unfocusable while the PIN gate is up, so focus must move into the gate (on a real
+            // remote, focus will not enter an overlay while anything beneath stays focusable).
+            .disabled(pinTarget != nil)
 
             if pinTarget != nil { pinGate }
         }

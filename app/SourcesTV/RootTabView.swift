@@ -15,29 +15,32 @@ final class PlayerPresenter: ObservableObject {
     @Published var request: PlaybackRequest?
 }
 
-/// App root: the player presents OVER the shell, which stays alive hidden + disabled, so closing
-/// the player returns to the exact page playback started from (episode list, detail, search…)
-/// instead of a rebuilt Home. Disabled views are unfocusable and the player's catcher window owns
-/// the remote (see TVPlayerView), so the TabView still can't steal a single press.
+/// App root, two focus rules learned the hard way:
+///  - The profile picker is ROOT REPLACEMENT: while it's up, the shell does not exist. On a real
+///    Siri remote the focus engine would not move into an overlay above the (even disabled) UIKit
+///    tab bar, leaving the picker unselectable; as the only root content it always gets focus.
+///    Nothing is lost: the picker only shows at cold start or on an explicit profile switch.
+///  - The player presents OVER the live but hidden + disabled shell, so closing it returns to the
+///    exact page playback started from; the player's catcher window owns the remote (TVPlayerView).
 struct RootView: View {
     @EnvironmentObject private var presenter: PlayerPresenter
     @EnvironmentObject private var profiles: ProfileStore
 
     var body: some View {
-        ZStack {
-            RootTabView()
-                .opacity(presenter.request == nil ? 1 : 0)
-                // Unfocusable while the player or the profile picker is up, so the focus engine
-                // has nowhere to live but the front-most surface.
-                .disabled(presenter.request != nil || profiles.needsPicker)
-            if let req = presenter.request {
-                TVPlayerView(url: req.url, title: req.title, meta: req.meta, episodes: req.episodes,
-                             onClose: { presenter.request = nil })
-                    .id(req.id)   // clean player teardown per request
-            }
-            // Who's watching? Once per cold start when there's a real choice; Settings re-opens it.
+        Group {
             if profiles.needsPicker && presenter.request == nil {
                 ProfilePickerView()
+            } else {
+                ZStack {
+                    RootTabView()
+                        .opacity(presenter.request == nil ? 1 : 0)
+                        .disabled(presenter.request != nil)
+                    if let req = presenter.request {
+                        TVPlayerView(url: req.url, title: req.title, meta: req.meta, episodes: req.episodes,
+                                     onClose: { presenter.request = nil })
+                            .id(req.id)   // clean player teardown per request
+                    }
+                }
             }
         }
     }
