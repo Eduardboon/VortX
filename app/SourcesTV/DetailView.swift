@@ -415,7 +415,10 @@ struct CoreStreamList: View {
                 // Watch-Now first: one press plays the best source; long-press picks another resolution;
                 // the full ranked list stays tucked behind "All sources".
                 HStack(spacing: Theme.Space.md) {
-                    Button { play(best) } label: {
+                    // Stays FOCUSABLE while gated (a disabled button is unfocusable on tvOS, which
+                    // dumped focus onto the Quality chip); the action is simply inert until the
+                    // add-ons settle, then the same focused button springs alive in place.
+                    Button { if watchReady { play(best) } } label: {
                         if watchReady {
                             Label("Watch in \(StreamRanking.qualityLabel(best))", systemImage: "play.fill")
                         } else {
@@ -426,7 +429,6 @@ struct CoreStreamList: View {
                         }
                     }
                     .buttonStyle(PrimaryActionStyle())
-                    .disabled(!watchReady)
                     .opacity(watchReady ? 1 : 0.55)
                     .contextMenu { resolutionMenu(groups) }
 

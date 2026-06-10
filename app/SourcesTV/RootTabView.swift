@@ -43,6 +43,12 @@ struct RootView: View {
                 }
             }
         }
+        // The tab bar's container can get parked far offscreen during the player's lifetime;
+        // re-home it the moment playback ends so the bar is summonable immediately.
+        .onChange(of: presenter.request?.id) {
+            guard presenter.request == nil else { return }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { TabBarSummoner.healTabBar() }
+        }
     }
 }
 
@@ -136,10 +142,35 @@ struct TabBarSummoner: View {
         for case let scene as UIWindowScene in UIApplication.shared.connectedScenes {
             for window in scene.windows {
                 guard let bar = firstTabBar(under: window.rootViewController) else { continue }
+                healIfParked(bar)
                 bar.setNeedsLayout()
                 UIFocusSystem.focusSystem(for: window)?.requestFocusUpdate(to: bar)
                 return
             }
+        }
+    }
+
+    /// Heal a wedged tab bar without focusing it (run when the player closes).
+    static func healTabBar() {
+        for case let scene as UIWindowScene in UIApplication.shared.connectedScenes {
+            for window in scene.windows {
+                guard let bar = firstTabBar(under: window.rootViewController) else { continue }
+                healIfParked(bar)
+                return
+            }
+        }
+    }
+
+    /// Under heavy load UIKit can park the bar's container absurdly far offscreen (seen live at
+    /// y = -1288 after a player close); the focus engine refuses to summon it from there and the
+    /// bar looks gone forever. Re-home it to the normal just-hidden position so the next focus
+    /// pass can slide it in.
+    private static func healIfParked(_ bar: UITabBar) {
+        guard let container = bar.superview else { return }
+        let height = max(container.frame.height, 68)
+        if container.frame.origin.y < -(height * 3) {
+            container.frame.origin.y = -height
+            container.setNeedsLayout()
         }
     }
 

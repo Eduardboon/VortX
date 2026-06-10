@@ -239,6 +239,11 @@ final class MPVMetalViewController: UIViewController {
         NotificationCenter.default.removeObserver(self)
         guard let handle = mpv else { return }
         mpv_set_wakeup_callback(handle, nil, nil)
+        // Tell the core to wind down NOW (mpv_command_string is thread-safe): decode and network
+        // stop immediately. Without this, destruction waited its turn on the event queue, and a
+        // stalled network read kept a ZOMBIE core decoding 4K invisibly for over a minute after
+        // close (seen live), starving the UI hard enough to wedge the tab bar.
+        mpv_command_string(handle, "quit")
         queue.async { [weak self] in
             self?.mpv = nil
             mpv_terminate_destroy(handle)
