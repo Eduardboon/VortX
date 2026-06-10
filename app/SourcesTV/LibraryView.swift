@@ -26,7 +26,7 @@ struct LibraryView: View {
                                 grid(library.catalog)
                             }
                         } else if account.isSignedIn {
-                            ProgressView().controlSize(.large).tint(Theme.Palette.accent)
+                            BigSpinner()
                                 .padding(Theme.Space.xxl).frame(maxWidth: .infinity)
                         } else {
                             CoreEmptyState.signedOut

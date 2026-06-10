@@ -141,7 +141,7 @@ struct TVPlayerView: View {
 
             if buffering && !loadFailed {
                 VStack(spacing: Theme.Space.md) {
-                    ProgressView().controlSize(.large).tint(Theme.Palette.accent)
+                    BigSpinner()
                     if reconnecting {
                         Text("Reconnecting…  (\(autoRetryCount)/\(maxAutoRetries))")
                             .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)

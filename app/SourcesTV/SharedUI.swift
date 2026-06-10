@@ -547,3 +547,12 @@ struct CoreEmptyState: View {
         )
     }
 }
+
+/// The standard large accent spinner. controlSize(.large) does not exist in
+/// older tvOS SDKs (the CI runner's Xcode fails on it), so the size comes from
+/// a scale instead, which renders the same everywhere.
+struct BigSpinner: View {
+    var body: some View {
+        ProgressView().scaleEffect(1.5).tint(Theme.Palette.accent)
+    }
+}

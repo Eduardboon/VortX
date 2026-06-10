@@ -24,7 +24,7 @@ struct DiscoverView: View {
                             genreChips(discover.selectable.extra)
                             grid(discover.items)
                         } else if account.isSignedIn {
-                            ProgressView().controlSize(.large).tint(Theme.Palette.accent)
+                            BigSpinner()
                                 .padding(Theme.Space.xxl).frame(maxWidth: .infinity)
                         } else {
                             CoreEmptyState.signedOut
@@ -87,7 +87,7 @@ struct DiscoverView: View {
 
     @ViewBuilder private func grid(_ items: [CoreMeta]) -> some View {
         if items.isEmpty {
-            ProgressView().controlSize(.large).tint(Theme.Palette.accent)
+            BigSpinner()
                 .padding(Theme.Space.xxl).frame(maxWidth: .infinity)
         } else {
             LazyVGrid(columns: columns, spacing: Theme.Space.xl) {

@@ -40,7 +40,7 @@ struct LinkLoginView: View {
                     .scaledToFit()
                     .frame(width: 286, height: 286)
             } else if busy {
-                ProgressView().controlSize(.large).tint(Theme.Palette.accent)
+                BigSpinner()
             } else {
                 Image(systemName: "qrcode")
                     .font(.system(size: 110))
