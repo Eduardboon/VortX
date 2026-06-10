@@ -214,10 +214,16 @@ final class ProfileStore: ObservableObject {
 
     /// Pull the remote roster once the account is reachable; newest side wins wholesale. AuthKeys
     /// never sync (each device signs into own-account profiles once); looks, PINs, and identity do.
+    /// Runs the libraryItem repair FIRST: the old transport's documents break the official apps'
+    /// library sync until scrubbed (see ProfileSync), and any watch history found in them is
+    /// migrated into the local cache so nothing is lost.
     func bootstrapSync() {
         guard let key = Keychain.string(Self.primaryTokenAccount), !key.isEmpty else { return }
         Task { [weak self] in
             guard let self else { return }
+            let salvaged = await ProfileSync.prepare(authKey: key)
+            if !salvaged.isEmpty { await MainActor.run { self.migrateSalvagedWatch(salvaged) } }
+            guard ProfileSync.cloudAvailable == true else { return }   // per-device profiles only
             if let remote = await ProfileSync.fetchRoster(authKey: key) {
                 let localModified = Date(timeIntervalSince1970:
                     UserDefaults.standard.double(forKey: Self.modifiedKey))
@@ -230,6 +236,27 @@ final class ProfileStore: ObservableObject {
                 await ProfileSync.pushRoster(profiles, authKey: key)   // first device seeds the roster
             }
             refreshWatchFromServer()
+        }
+    }
+
+    /// One-time rescue of overlay history written through the old (poisonous) transport: merge it
+    /// into each profile's local cache, then push it through the new transport on the next change.
+    private func migrateSalvagedWatch(_ salvaged: [String: String]) {
+        for profile in profiles {
+            guard let payload = salvaged[ProfileSync.salvagedWatchKey(for: profile.id)],
+                  let entries = ProfileSync.decodeWatchPayload(payload), !entries.isEmpty else { continue }
+            var cached: [String: WatchEntry] = [:]
+            if let data = UserDefaults.standard.data(forKey: Self.watchCacheKey(profile.id)),
+               let existing = try? JSONDecoder().decode([String: WatchEntry].self, from: data) {
+                cached = existing
+            }
+            for (metaId, entry) in entries where (cached[metaId]?.lastWatched ?? "") < entry.lastWatched {
+                cached[metaId] = entry
+            }
+            if let data = try? JSONEncoder().encode(cached) {
+                UserDefaults.standard.set(data, forKey: Self.watchCacheKey(profile.id))
+            }
+            if profile.id == activeID, !profile.usesEngineHistory { watch = cached }
         }
     }
 

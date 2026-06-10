@@ -22,81 +22,71 @@ struct WatchEntry: Codable, Equatable {
 /// Syncs profile data through the Stremio account's datastore, so profiles and their watch
 /// history follow the account to every device running StremioX.
 ///
-/// Storage trick: each payload lives in a `libraryItem` document with `type: "other"` and
-/// `removed: true`. That combination is invisible everywhere: stremio-core excludes type "other"
-/// from Continue Watching and removed items from the library views, and the official apps run the
-/// same core. But the documents still sync with the account like any library item. Payloads ride
-/// in custom top-level fields, which the API stores as-is; the engine never pushes back documents
-/// it hasn't mutated, so the custom fields survive engine syncs.
+/// Transport: our OWN datastore collection. Official clients only ever pull the collections they
+/// know ("libraryItem", ...), so documents in a different collection are invisible to them and
+/// carry whatever shape we want.
+///
+/// HISTORY, do not repeat it: two earlier transports rode inside `libraryItem` documents. Custom
+/// top-level fields were silently STRIPPED by the API's schema normalization, and smuggling JSON
+/// into the schema string field `state.watched` PARSED in official apps' stremio-core as a
+/// watched-bitfield and FAILED, which broke the library pull for the entire account in every
+/// official Stremio app ("Serialization error: state.watched: invalid digit found in string").
+/// `repairPoisonedLibrary` scrubs those documents and runs on every launch until clean.
 enum ProfileSync {
     private static let api = "https://api.strem.io/api"
+    private static let collection = "stremioxProfiles"     // our own, invisible to official clients
     private static let rosterID = "stremiox:profiles"
     private static let log = Logger(subsystem: "com.stremiox.app", category: "profilesync")
 
+    /// nil = not probed yet; false = the API refused our collection, cloud sync is disabled and
+    /// profiles stay per-device (never fall back to libraryItem smuggling again).
+    private(set) static var cloudAvailable: Bool?
+
     private static func watchID(_ profileID: UUID) -> String { "stremiox:watch:\(profileID.uuidString)" }
 
-    // MARK: Roster (profile list, synced on the PRIMARY account)
+    // MARK: Launch preparation: repair the old poison, then probe our collection
 
-    /// The remote roster and its modification time, or nil when none was ever pushed.
-    static func fetchRoster(authKey: String) async -> (profiles: [UserProfile], mtime: Date)? {
-        guard let data = await fetchPayload(id: rosterID, authKey: authKey),
-              let profiles = try? JSONDecoder().decode([UserProfile].self, from: data.payload),
-              !profiles.isEmpty else { return nil }
-        log.info("roster fetched: \(profiles.count) profiles")
-        return (profiles, data.mtime)
+    /// Idempotent and cheap once clean. Returns watch payloads salvaged from the old transport
+    /// (keyed by document id) so they can be migrated.
+    static func prepare(authKey: String) async -> [String: String] {
+        let salvaged = await repairPoisonedLibrary(authKey: authKey)
+        if cloudAvailable == nil {
+            await probeCollection(authKey: authKey)
+        }
+        return salvaged
     }
 
-    static func pushRoster(_ profiles: [UserProfile], authKey: String) async {
-        guard let data = try? JSONEncoder().encode(profiles) else { return }
-        await pushPayload(data, id: rosterID, name: "StremioX Profiles", authKey: authKey)
-        log.info("roster pushed: \(profiles.count) profiles")
+    /// Scrub every `stremiox:*` document the old transports left in the account's libraryItem
+    /// collection: their `state.watched` JSON breaks the official apps' library deserialization.
+    /// Overwrites each with a valid empty watched string (the documents stay invisible: type
+    /// "other" + removed). Returns the payloads found, so watch history can be salvaged.
+    private static func repairPoisonedLibrary(authKey: String) async -> [String: String] {
+        let body: [String: Any] = ["authKey": authKey, "collection": "libraryItem", "all": true]
+        guard let data = try? await post("datastoreGet", body: body),
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let items = object["result"] as? [[String: Any]] else {
+            log.error("repair: could not list the library")
+            return [:]
+        }
+        var salvaged: [String: String] = [:]
+        var repaired = 0
+        for item in items {
+            guard let id = item["_id"] as? String, id.hasPrefix("stremiox:") else { continue }
+            let watched = (item["state"] as? [String: Any])?["watched"] as? String ?? ""
+            if !watched.isEmpty { salvaged[id] = watched }
+            guard !watched.isEmpty else { continue }   // already clean
+            await putLibraryItem(sanitizedDoc(id: id, name: item["name"] as? String ?? "StremioX"),
+                                 authKey: authKey)
+            repaired += 1
+        }
+        if repaired > 0 {
+            log.info("repair: scrubbed \(repaired) poisoned documents; official apps can sync again")
+        }
+        return salvaged
     }
 
-    // MARK: Watch overlay (per profile, synced on that profile's account)
-
-    static func fetchWatch(profileID: UUID, authKey: String) async -> [String: WatchEntry]? {
-        guard let data = await fetchPayload(id: watchID(profileID), authKey: authKey),
-              let watch = try? JSONDecoder().decode([String: WatchEntry].self, from: data.payload) else { return nil }
-        log.info("watch overlay fetched from server: \(watch.count) entries")
-        return watch
-    }
-
-    static func pushWatch(_ watch: [String: WatchEntry], profileID: UUID, authKey: String) async {
-        // Keep the document a sane size: the rail only ever shows recent titles anyway.
-        let trimmed = watch.count <= 120 ? watch
-            : Dictionary(uniqueKeysWithValues: watch.sorted { $0.value.lastWatched > $1.value.lastWatched }
-                .prefix(120).map { ($0.key, $0.value) })
-        guard let data = try? JSONEncoder().encode(trimmed) else { return }
-        await pushPayload(data, id: watchID(profileID), name: "StremioX Profile Watch", authKey: authKey)
-        log.info("watch overlay pushed: \(trimmed.count) entries")
-    }
-
-    // MARK: Payload transport
-    //
-    // The API normalizes libraryItem documents against its schema and STRIPS unknown fields
-    // (verified live: a custom top-level field came back missing). `state.watched` is a schema
-    // STRING field designed to carry long opaque per-account data (real watched bitfields run to
-    // kilobytes), so the payload rides there as a JSON string and survives validation verbatim.
-
-    private static func pushPayload(_ payload: Data, id: String, name: String, authKey: String) async {
-        guard let string = String(data: payload, encoding: .utf8) else { return }
-        await putItem(blobSkeleton(id: id, name: name, watched: string), authKey: authKey)
-    }
-
-    private static func fetchPayload(id: String, authKey: String) async -> (payload: Data, mtime: Date)? {
-        guard let item = await fetchItem(id: id, authKey: authKey),
-              let state = item["state"] as? [String: Any],
-              let string = state["watched"] as? String, !string.isEmpty,
-              let payload = string.data(using: .utf8) else { return nil }
-        let mtime = (item["_mtime"] as? String).flatMap(parseISO) ?? .distantPast
-        return (payload, mtime)
-    }
-
-    // MARK: Datastore plumbing
-
-    /// A libraryItem document no Stremio client will ever display (type "other" + removed, never
-    /// in Continue Watching or library views), used purely as synced storage.
-    private static func blobSkeleton(id: String, name: String, watched: String) -> [String: Any] {
+    /// A valid, schema-clean, invisible libraryItem (empty watched string parses fine everywhere).
+    private static func sanitizedDoc(id: String, name: String) -> [String: Any] {
         let now = isoNow()
         return [
             "_id": id,
@@ -109,34 +99,96 @@ enum ProfileSync {
             "_mtime": now,
             "state": ["lastWatched": now, "timeWatched": 0, "timeOffset": 0, "overallTimeWatched": 0,
                       "timesWatched": 0, "flaggedWatched": 0, "duration": 0, "video_id": "",
-                      "watched": watched, "noNotif": true] as [String: Any],
+                      "watched": "", "noNotif": true] as [String: Any],
         ]
     }
 
-    private static func fetchItem(id: String, authKey: String) async -> [String: Any]? {
-        let body: [String: Any] = ["authKey": authKey, "collection": "libraryItem", "ids": [id], "all": false]
-        guard let data = try? await post("datastoreGet", body: body),
-              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-            log.error("datastoreGet \(id, privacy: .public): request failed")
-            return nil
-        }
-        guard let result = object["result"] as? [[String: Any]], let item = result.first else {
-            let raw = String(data: data, encoding: .utf8)?.prefix(300) ?? "?"
-            log.info("datastoreGet \(id, privacy: .public): empty result (\(String(raw), privacy: .public))")
-            return nil
-        }
-        log.info("datastoreGet \(id, privacy: .public): keys \(item.keys.sorted().joined(separator: ","), privacy: .public)")
-        return item
+    /// One write + read against our own collection decides whether cloud sync is on.
+    private static func probeCollection(authKey: String) async {
+        let probeID = "stremiox:probe"
+        await putDocument(["_id": probeID, "_mtime": isoNow(), "payload": "ok"], authKey: authKey)
+        let echoed = await fetchDocument(id: probeID, authKey: authKey)?["payload"] as? String
+        cloudAvailable = (echoed == "ok")
+        log.info("custom collection probe: \(cloudAvailable == true ? "available, cloud sync on" : "unavailable, profiles stay per-device")")
     }
 
-    private static func putItem(_ item: [String: Any], authKey: String) async {
-        let body: [String: Any] = ["authKey": authKey, "collection": "libraryItem", "changes": [item]]
+    // MARK: Roster (profile list, synced on the PRIMARY account)
+
+    /// The remote roster and its modification time, or nil when none was ever pushed.
+    static func fetchRoster(authKey: String) async -> (profiles: [UserProfile], mtime: Date)? {
+        guard cloudAvailable == true,
+              let document = await fetchDocument(id: rosterID, authKey: authKey),
+              let payload = (document["payload"] as? String)?.data(using: .utf8),
+              let profiles = try? JSONDecoder().decode([UserProfile].self, from: payload),
+              !profiles.isEmpty else { return nil }
+        let mtime = (document["_mtime"] as? String).flatMap(parseISO) ?? .distantPast
+        log.info("roster fetched: \(profiles.count) profiles")
+        return (profiles, mtime)
+    }
+
+    static func pushRoster(_ profiles: [UserProfile], authKey: String) async {
+        guard cloudAvailable == true,
+              let data = try? JSONEncoder().encode(profiles),
+              let string = String(data: data, encoding: .utf8) else { return }
+        await putDocument(["_id": rosterID, "_mtime": isoNow(), "payload": string], authKey: authKey)
+        log.info("roster pushed: \(profiles.count) profiles")
+    }
+
+    // MARK: Watch overlay (per profile, synced on that profile's account)
+
+    static func fetchWatch(profileID: UUID, authKey: String) async -> [String: WatchEntry]? {
+        guard cloudAvailable == true,
+              let document = await fetchDocument(id: watchID(profileID), authKey: authKey),
+              let payload = (document["payload"] as? String)?.data(using: .utf8),
+              let watch = try? JSONDecoder().decode([String: WatchEntry].self, from: payload) else { return nil }
+        log.info("watch overlay fetched from server: \(watch.count) entries")
+        return watch
+    }
+
+    static func pushWatch(_ watch: [String: WatchEntry], profileID: UUID, authKey: String) async {
+        guard cloudAvailable == true else { return }
+        // Keep the document a sane size: the rail only ever shows recent titles anyway.
+        let trimmed = watch.count <= 120 ? watch
+            : Dictionary(uniqueKeysWithValues: watch.sorted { $0.value.lastWatched > $1.value.lastWatched }
+                .prefix(120).map { ($0.key, $0.value) })
+        guard let data = try? JSONEncoder().encode(trimmed),
+              let string = String(data: data, encoding: .utf8) else { return }
+        await putDocument(["_id": watchID(profileID), "_mtime": isoNow(), "payload": string],
+                          authKey: authKey)
+        log.info("watch overlay pushed: \(trimmed.count) entries")
+    }
+
+    /// Decode a watch payload salvaged from the old transport (for one-time migration).
+    static func decodeWatchPayload(_ string: String) -> [String: WatchEntry]? {
+        guard let data = string.data(using: .utf8) else { return nil }
+        return try? JSONDecoder().decode([String: WatchEntry].self, from: data)
+    }
+
+    static func salvagedWatchKey(for profileID: UUID) -> String { watchID(profileID) }
+
+    // MARK: Datastore plumbing
+
+    private static func fetchDocument(id: String, authKey: String) async -> [String: Any]? {
+        let body: [String: Any] = ["authKey": authKey, "collection": collection, "ids": [id], "all": false]
+        guard let data = try? await post("datastoreGet", body: body),
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let result = object["result"] as? [[String: Any]] else { return nil }
+        return result.first
+    }
+
+    private static func putDocument(_ document: [String: Any], authKey: String) async {
+        let body: [String: Any] = ["authKey": authKey, "collection": collection, "changes": [document]]
         guard let data = try? await post("datastorePut", body: body) else {
-            log.error("datastorePut \(item["_id"] as? String ?? "?", privacy: .public): request failed")
+            log.error("datastorePut \(document["_id"] as? String ?? "?", privacy: .public): request failed")
             return
         }
         let raw = String(data: data, encoding: .utf8)?.prefix(200) ?? "?"
-        log.info("datastorePut \(item["_id"] as? String ?? "?", privacy: .public): \(String(raw), privacy: .public)")
+        log.info("datastorePut \(document["_id"] as? String ?? "?", privacy: .public): \(String(raw), privacy: .public)")
+    }
+
+    private static func putLibraryItem(_ item: [String: Any], authKey: String) async {
+        let body: [String: Any] = ["authKey": authKey, "collection": "libraryItem", "changes": [item]]
+        _ = try? await post("datastorePut", body: body)
     }
 
     private static func post(_ path: String, body: [String: Any]) async throws -> Data {
