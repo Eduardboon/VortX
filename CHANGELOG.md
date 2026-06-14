@@ -4,6 +4,11 @@ All notable changes to StremioX, newest first. StremioX is Apple TV first, with 
 
 What is planned next is in [ROADMAP.md](ROADMAP.md). To request a feature or report a bug, start a [GitHub Discussion](https://github.com/mamaclapper/StremioX/discussions) or [open an issue](https://github.com/mamaclapper/StremioX/issues).
 
+## 0.3.0 beta 12 (prerelease) - 2026-06-14
+
+### Changed
+- **The streaming server now follows the Performance setting.** Its torrent cache is sized off the same Auto/Full/Reduced switch the rest of the app uses (Settings > Performance), so the lighter server isn't limited to auto-detected low-memory hardware — you can force the lean 256 MB server on any device by choosing Reduced. This also applies to memory-tight iPhones, not just the Apple TV.
+
 ## 0.3.0 beta 11 (prerelease) - 2026-06-14
 
 Priority fix for the Apple TV streaming-server death (issue #56).
