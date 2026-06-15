@@ -355,6 +355,10 @@ final class MPVMetalViewController: PlatformViewController {
         // log. With this off, a failure surfaces as MPV_EVENT_LOG_MESSAGE (captured in DEBUG) so
         // the next silent-audio report is actually diagnosable instead of a guess.
         checkError(mpv_set_option_string(mpv, "audio-fallback-to-null", "no"))
+        // Normalize the 5.1 -> stereo downmix so the center channel (dialogue) is not attenuated and the
+        // mix can't clip. Without this, downmixed stereo plays noticeably quieter than other players
+        // (the recurring "dialogue is tiny" report). No-op when the route takes native multichannel.
+        checkError(mpv_set_option_string(mpv, "audio-normalize-downmix", "yes"))
         // THE soundbar fix: resample to the route's actual rate so a rate mismatch over a fixed-rate
         // HDMI-ARC link can't drop to silence (mpv's audiounit AO does not resample to the route).
         if let rate = sampleRatePolicy {
@@ -573,7 +577,10 @@ final class MPVMetalViewController: PlatformViewController {
             args.append(options.joined(separator: ","))
         }
 
-        mpvLog.log("loadFile → \(url.absoluteString, privacy: .public)")
+        // Log only scheme://host/path: debrid and direct-CDN URLs carry API tokens / signed queries in the
+        // userinfo and query string, which must not land in the device's persistent unified log.
+        let redactedURL = "\(url.scheme ?? "?")://\(url.host ?? "?")\(url.path)"
+        mpvLog.log("loadFile → \(redactedURL, privacy: .public)")
         command("loadfile", args: args)
     }
 
@@ -1054,7 +1061,9 @@ final class MPVMetalViewController: PlatformViewController {
                         let prefix = String(cString: msg.pointee.prefix)
                         let level = String(cString: msg.pointee.level)
                         let text = String(cString: msg.pointee.text).trimmingCharacters(in: .newlines)
-                        if !text.isEmpty { self.mpvLog.log("[\(prefix, privacy: .public)/\(level, privacy: .public)] \(text, privacy: .public)") }
+                        // mpv's verbose log echoes resolved URLs and request headers (Authorization / Cookie),
+                        // so keep the message body private; prefix + level stay public for log filtering.
+                        if !text.isEmpty { self.mpvLog.log("[\(prefix, privacy: .public)/\(level, privacy: .public)] \(text, privacy: .private)") }
                     }
                 default:
                     let eventName = mpv_event_name(event!.pointee.event_id )
