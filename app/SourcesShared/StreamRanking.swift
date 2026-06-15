@@ -87,6 +87,7 @@ enum StreamRanking {
     /// score. bingeGroup (exact, from the add-on) outweighs the quality-signature
     /// heuristic; both fall back to the plain best when absent.
     static func best(_ groups: [CoreStreamSourceGroup], continuity hint: String?, binge: String? = nil) -> CoreStream? {
+        let groups = applyUserFilters(groups)
         if SourcePreferences.shared.useAddonOrder {
             return groups.flatMap { $0.streams }.first { $0.playableURL != nil }
         }
@@ -432,7 +433,35 @@ enum StreamRanking {
 
     /// Each group's streams sorted best-first, stable within equal scores (so add-on order is preserved
     /// among ties). Scores are computed once per stream, not per comparison.
+    /// Whether a stream survives the user's keyword + safety filters (Settings > Streams). Default
+    /// preferences pass everything, so this is a no-op until the user opts in.
+    static func passesUserFilters(_ s: CoreStream) -> Bool {
+        let prefs = SourcePreferences.shared
+        let exclude = prefs.excludeTerms, include = prefs.includeTerms, safety = prefs.safetyMode
+        if exclude.isEmpty, include.isEmpty, safety == "off" { return true }   // fast path: nothing set
+        let text = qualityText(s)
+        if exclude.contains(where: { text.contains($0) }) { return false }
+        if !include.isEmpty, !include.contains(where: { text.contains($0) }) { return false }
+        switch safety {
+        case "balanced": if junkClass(text) != nil { return false }
+        case "strict":   if junkClass(text) != nil || implausibleForResolution(text) { return false }
+        default: break
+        }
+        return true
+    }
+
+    /// Drop streams that fail the user filters, and any group left empty. No-op when nothing is set.
+    static func applyUserFilters(_ groups: [CoreStreamSourceGroup]) -> [CoreStreamSourceGroup] {
+        let prefs = SourcePreferences.shared
+        guard !(prefs.excludeTerms.isEmpty && prefs.includeTerms.isEmpty && prefs.safetyMode == "off") else { return groups }
+        return groups.compactMap { group in
+            let kept = group.streams.filter { passesUserFilters($0) }
+            return kept.isEmpty ? nil : CoreStreamSourceGroup(id: group.id, addon: group.addon, streams: kept)
+        }
+    }
+
     static func rankedGroups(_ groups: [CoreStreamSourceGroup]) -> [CoreStreamSourceGroup] {
+        let groups = applyUserFilters(groups)
         guard !SourcePreferences.shared.useAddonOrder else { return groups }
         return groups.map { group in
             var scored: [(stream: CoreStream, score: Int, index: Int)] = []
@@ -446,6 +475,7 @@ enum StreamRanking {
 
     /// The single best playable stream across all groups, for the one-press "Watch Now".
     static func best(_ groups: [CoreStreamSourceGroup]) -> CoreStream? {
+        let groups = applyUserFilters(groups)
         if SourcePreferences.shared.useAddonOrder {
             return groups.flatMap { $0.streams }.first { $0.playableURL != nil }
         }

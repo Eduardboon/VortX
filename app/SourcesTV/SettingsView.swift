@@ -373,6 +373,17 @@ struct SettingsView: View {
                 Text("Sources matching the top type are ranked first within each quality tier. Debrid and Usenet are always instant; Torrent streams require peer availability.")
                     .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
             }
+            choiceRow("Safety filter", [("off", "Off"), ("balanced", "Balanced"), ("strict", "Strict")], selection: $sourcePrefs.safetyMode)
+            Text("Hides CAM and fake-quality sources. Hide / Require words filter the list by name (comma-separated).")
+                .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
+            HStack(spacing: Theme.Space.md) {
+                Text("Hide words").font(Theme.Typography.cardTitle).foregroundStyle(Theme.Palette.textPrimary)
+                TextField("none", text: $sourcePrefs.excludeKeywords)
+            }
+            HStack(spacing: Theme.Space.md) {
+                Text("Require words").font(Theme.Typography.cardTitle).foregroundStyle(Theme.Palette.textPrimary)
+                TextField("none", text: $sourcePrefs.includeKeywords)
+            }
         }
     }
 

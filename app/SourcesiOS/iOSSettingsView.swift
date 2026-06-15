@@ -293,6 +293,21 @@ struct iOSSettingsView: View {
                     }
                 }
             }
+            Picker("Safety filter", selection: $sourcePrefs.safetyMode) {
+                Text("Off").tag("off")
+                Text("Balanced").tag("balanced")
+                Text("Strict").tag("strict")
+            }
+            TextField("Hide words", text: $sourcePrefs.excludeKeywords)
+                .autocorrectionDisabled()
+                #if os(iOS)
+                .textInputAutocapitalization(.never)
+                #endif
+            TextField("Require words", text: $sourcePrefs.includeKeywords)
+                .autocorrectionDisabled()
+                #if os(iOS)
+                .textInputAutocapitalization(.never)
+                #endif
         } header: {
             Text("Streams")
         } footer: {
@@ -301,6 +316,7 @@ struct iOSSettingsView: View {
                 if !sourcePrefs.useAddonOrder {
                     Text("Sources matching the top type are ranked first within each quality tier. Debrid and Usenet are always instant; Torrent streams require peer availability.")
                 }
+                Text("Safety filter hides CAM and fake-quality sources. Hide / Require words filter the source list by name, comma-separated (e.g. hide \"cam, ts\", require \"remux\").")
             }
         }
     }
