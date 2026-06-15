@@ -85,12 +85,13 @@ struct PlayerScreen: View {
     // MARK: Panels
 
     private enum Panel: Identifiable, Equatable {
-        case speed, subtitles, subtitleSettings, audio, audioSettings, video, sources, episodes, info, playerSettings, sleep, quality
+        case speed, subtitles, subtitleSettings, audio, audioSettings, video, sources, episodes, info, playerSettings, sleep, quality, chapters
         var id: Int {
             switch self {
             case .speed: 0; case .subtitles: 1; case .subtitleSettings: 2; case .audio: 3
             case .audioSettings: 4; case .video: 5; case .sources: 6; case .info: 7
             case .playerSettings: 8; case .sleep: 9; case .episodes: 10; case .quality: 11
+            case .chapters: 12
             }
         }
         var title: String {
@@ -100,6 +101,7 @@ struct PlayerScreen: View {
             case .audioSettings: "Audio Settings"; case .video: "Aspect Ratio"
             case .sources: "Sources"; case .info: "Playback Info"; case .playerSettings: "Player Settings"
             case .sleep: "Sleep Timer"; case .episodes: "Episodes"; case .quality: "Quality"
+            case .chapters: "Chapters"
             }
         }
     }
@@ -1142,6 +1144,10 @@ struct PlayerScreen: View {
                     Spacer()
                     controlButton("list.bullet", "Episodes") { openPanel(.episodes) }
                 }
+                if hasChapters {
+                    Spacer()
+                    controlButton("list.bullet.below.rectangle", "Chapters") { openPanel(.chapters) }
+                }
                 Spacer()
                 controlButton(sleepArmed ? "moon.zzz.fill" : "moon.zzz", sleepLabel) { openPanel(.sleep) }
             }
@@ -1475,6 +1481,17 @@ struct PlayerScreen: View {
             }
             if rows.isEmpty { return [Row(label: "No info yet", isHeader: true)] }
             return rows
+        case .chapters:
+            let chs = coordinator.player?.chapters() ?? []
+            if chs.isEmpty { return [Row(label: "No chapters", isHeader: true)] }
+            // Current chapter = the last one starting at or before the play head; tapping seeks to its start.
+            let currentIdx = chs.lastIndex { $0.start <= currentTime + 0.5 }
+            return chs.enumerated().map { i, ch in
+                Row(label: ch.title.isEmpty ? "Chapter \(i + 1)" : ch.title,
+                    detail: timeString(ch.start), selected: i == currentIdx) {
+                    coordinator.player?.seek(to: ch.start)
+                }
+            }
         case .playerSettings:
             let hw = coordinator.player?.hardwareDecoding ?? true
             return [
@@ -1547,6 +1564,11 @@ struct PlayerScreen: View {
     private var hasMultipleQualities: Bool {
         StreamRanking.resolutionOptions(currentSourceGroups).count > 1
     }
+
+    /// The file carries embedded chapter markers (more than the implicit single whole-file chapter), so the
+    /// Chapters navigator is worth offering. Reads mpv's chapter-list, the same data the skip-intro detector
+    /// already uses.
+    private var hasChapters: Bool { (coordinator.player?.chapters().count ?? 0) > 1 }
 
     /// Up to a capped number of loaded sources, grouped by add-on in their existing priority order, so
     /// switching is quick. The full (sometimes thousands-long) list stays on the detail page; capping

@@ -127,8 +127,8 @@ struct TVPlayerView: View {
     @State private var localTrickplayCaptureInFlight = false
 
     /// Which on-screen control is currently highlighted (driven by remote left/right, not SwiftUI focus).
-    private enum Control: Hashable { case close, scrub, restart, back, play, fwd, audio, subs, aspect, playback, prev, next, episodes, sources, settings }
-    private enum PanelKind { case audio, audioSettings, subtitles, subtitleSettings, aspect, playback, episodes, sources, playerSettings }
+    private enum Control: Hashable { case close, scrub, restart, back, play, fwd, audio, subs, aspect, playback, prev, next, episodes, chapters, sources, settings }
+    private enum PanelKind { case audio, audioSettings, subtitles, subtitleSettings, aspect, playback, episodes, chapters, sources, playerSettings }
     @State private var selected: Control = .play
     @State private var lastButton: Control = .play     // remembered button-row spot, so up-then-down returns to it
     // Scrub-to-seek: left/right on the scrubber moves a preview playhead (accelerating on rapid/held
@@ -385,6 +385,7 @@ struct TVPlayerView: View {
         c.append(.playback)
         if hasAlternateSources { c.append(.sources) }   // was drawn but missing here → unreachable by remote
         if allEpisodes.count > 1 { c.append(.episodes) }
+        if hasChapters { c.append(.chapters) }
         return c
     }
 
@@ -443,6 +444,7 @@ struct TVPlayerView: View {
         case .aspect:   openPanel(.aspect)
         case .playback: openPanel(.playback)
         case .episodes: openPanel(.episodes)
+        case .chapters: openPanel(.chapters)
         case .sources:  openPanel(.sources)
         case .settings: openPanel(.playerSettings)
         }
@@ -575,6 +577,7 @@ struct TVPlayerView: View {
                         ctrlButton(.playback, "speedometer")
                         if hasAlternateSources { ctrlButton(.sources, "rectangle.2.swap") }
                         if allEpisodes.count > 1 { ctrlButton(.episodes, "list.bullet") }
+                        if hasChapters { ctrlButton(.chapters, "list.bullet.below.rectangle") }
                     }
                     .frame(maxWidth: .infinity, alignment: .trailing)
                 }
@@ -738,6 +741,17 @@ struct TVPlayerView: View {
                     play(episode: ep)
                 }
             }
+        case .chapters:
+            let chs = coordinator.player?.chapters() ?? []
+            if chs.isEmpty { return [OptionRow(label: "No chapters", isHeader: true)] }
+            // Current chapter = the last one starting at or before the play head; selecting seeks to it.
+            let currentIdx = chs.lastIndex { $0.start <= currentTime + 0.5 }
+            return chs.enumerated().map { i, ch in
+                OptionRow(label: ch.title.isEmpty ? "Chapter \(i + 1)" : ch.title,
+                          detail: timeString(ch.start), isSelected: i == currentIdx) {
+                    coordinator.player?.seek(to: ch.start)
+                }
+            }
         case .sources:
             return sourceRows()
         }
@@ -775,6 +789,10 @@ struct TVPlayerView: View {
     private var hasAlternateSources: Bool {
         core.streamGroups().reduce(0) { $0 + $1.streams.filter { $0.playableURL != nil }.count } > 1
     }
+
+    /// The file carries embedded chapter markers (beyond the implicit whole-file chapter), so the Chapters
+    /// navigator is worth offering. Same mpv chapter-list the skip-intro detector reads.
+    private var hasChapters: Bool { (coordinator.player?.chapters().count ?? 0) > 1 }
 
     /// Up to `maxInPlayerSources` loaded sources, grouped by add-on in their existing priority order, so
     /// switching is quick. The full (sometimes thousands-long) source list stays on the detail page;
@@ -995,6 +1013,7 @@ struct TVPlayerView: View {
         case .aspect:           return "Aspect Ratio"
         case .playback:         return "Playback"
         case .episodes:         return "Episodes"
+        case .chapters:         return "Chapters"
         case .sources:          return "Sources"
         case .playerSettings:   return "Player Settings"
         }
