@@ -272,6 +272,13 @@ struct iOSHomeView: View {
                                                     genres: $0.genres)
                                        },
                                        onTap: handleTap)
+                                // Vertical infinite scroll: reaching the last populated catalog row loads the
+                                // next page of Home catalogs (no-op past the end / while one is in flight).
+                                .onAppear {
+                                    if row.id == core.boardRows.last(where: { !$0.items.isEmpty })?.id {
+                                        core.loadBoardNextPage()
+                                    }
+                                }
                         }
                     }
                     if core.boardRows.isEmpty && core.continueWatching.isEmpty {
@@ -679,7 +686,10 @@ struct iOSDiscoverView: View {
                                         .buttonStyle(ChipButtonStyle(selected: o.selected)) } }
                             }
                         }
-                        PosterGrid(items: discover.items.map {
+                        // De-dup by id: paginated catalogs can repeat a title across pages, and the grid's
+                        // ForEach is keyed by id, so duplicates would trip SwiftUI's "id occurs multiple
+                        // times" warning and silently drop the later cells (mirrors the search path).
+                        PosterGrid(items: dedupedMetasById(discover.items).map {
                             RailItem(id: $0.id, type: $0.type, name: $0.name, poster: $0.poster, progress: 0,
                                      background: $0.background, description: $0.description,
                                      releaseInfo: $0.releaseInfo, imdbRating: $0.imdbRating, genres: $0.genres)
@@ -741,6 +751,14 @@ struct iOSDiscoverView: View {
 /// detail route opened on tap arrives with rich seed data — they're present on `CoreMeta` but were
 /// previously dropped at the `.map`. Continue Watching / Library entries lack a `background`, so the
 /// hero derives 16:9 art from metahub-by-IMDB-id (see `FeaturedHeroItem.from`).
+/// Keep the first occurrence of each meta id, dropping later duplicates. Paginated catalogs can repeat a
+/// title across pages, and a grid `ForEach` keyed by id would otherwise warn and silently drop the later
+/// cells (the search path already de-dups the same way).
+private func dedupedMetasById(_ metas: [CoreMeta]) -> [CoreMeta] {
+    var seen = Set<String>()
+    return metas.filter { seen.insert($0.id).inserted }
+}
+
 struct RailItem: Identifiable {
     let id: String
     let type: String

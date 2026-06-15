@@ -215,12 +215,37 @@ final class CoreBridge: ObservableObject {
     /// Load the Home board: every catalog of every installed addon, then fetch the first `rows`.
     /// (Targets the `board` field specifically, `search` is also a CatalogsWithExtra.)
     func loadBoard(rows: Int = 30) {
+        boardRowsLoaded = rows
+        boardPageInFlight = false
         dispatch(action: ["action": "Load",
                           "args": ["model": "CatalogsWithExtra",
                                    "args": ["type": NSNull(), "extra": []]]],
                  field: "board")
         dispatch(action: ["action": "CatalogsWithExtra",
                           "args": ["action": "LoadRange", "args": ["start": 0, "end": rows]]],
+                 field: "board")
+    }
+
+    /// How wide a board window (catalog-row count) has been requested so far; grows as the user scrolls
+    /// the Home page to the bottom. The board paginates by ROWS (whole catalogs / rails), not by items.
+    private var boardRowsLoaded = 30
+    /// Set while a wider board load is dispatched, cleared when `board` re-emits, so a burst of last-row
+    /// onAppear events can't fire duplicate loads (mirrors `discoverPageInFlight`).
+    private var boardPageInFlight = false
+
+    /// True while the last board load filled its requested window, so there may be more catalogs to show.
+    /// Once the engine returns fewer rows than asked, every catalog is on screen and this goes false.
+    var boardHasNextPage: Bool { boardRows.count >= boardRowsLoaded }
+
+    /// Load the next page of Home catalogs (the vertical infinite scroll). Re-dispatches a wider LoadRange
+    /// so more catalog rows hydrate; no-op at the end or while a page is already in flight. Without this
+    /// Home was permanently capped at its first 30 catalogs.
+    func loadBoardNextPage(step: Int = 30) {
+        guard boardHasNextPage, !boardPageInFlight else { return }
+        boardPageInFlight = true
+        boardRowsLoaded += step
+        dispatch(action: ["action": "CatalogsWithExtra",
+                          "args": ["action": "LoadRange", "args": ["start": 0, "end": boardRowsLoaded]]],
                  field: "board")
     }
 
@@ -869,7 +894,7 @@ final class CoreBridge: ObservableObject {
         // The board needs ctx (addon manifests) for row titles, so rebuild on either change.
         if fields.contains("board") || fields.contains("ctx") {
             let rows = buildBoardRows()
-            DispatchQueue.main.async { [weak self] in self?.boardRows = rows }
+            DispatchQueue.main.async { [weak self] in self?.boardRows = rows; self?.boardPageInFlight = false }
         }
         if fields.contains("ctx") {
             DispatchQueue.main.async { [weak self] in self?.addonNamesCache = nil }   // addon set changed → rebuild name map
