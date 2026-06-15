@@ -21,6 +21,7 @@
 		<string>infuse</string>
 		<string>vlc-x-callback</string>
 		<string>vlc</string>
+		<string>outplayer</string>
 	</array>
 	<!-- Keep audio playing (and, crucially, the in-process streaming server thread alive) when the
 	     screen locks or the app briefly backgrounds during playback. Without this, iOS suspends the

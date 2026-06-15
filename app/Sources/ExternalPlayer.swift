@@ -44,6 +44,11 @@ enum ExternalPlayer {
                make: { stream in
                    encoded(stream).flatMap { URL(string: "vlc-x-callback://x-callback-url/stream?url=\($0)") }
                }),
+        Target(id: "outplayer", name: "Outplayer", icon: "play.circle.fill",
+               probe: URL(string: "outplayer://")!,
+               make: { stream in
+                   encoded(stream).flatMap { URL(string: "outplayer://play?url=\($0)") }
+               }),
     ]
 
     /// Only the targets actually installed on this device, what the chooser should offer.
