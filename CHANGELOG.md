@@ -2,11 +2,11 @@
 
 All notable changes to StremioX, newest first. StremioX is Apple TV first, with an iPhone and iPad build alongside it. Dates are when each version was published.
 
-What is planned next is in [ROADMAP.md](ROADMAP.md). To request a feature or report a bug, start a [GitHub Discussion](https://github.com/mamaclapper/StremioX/discussions) or [open an issue](https://github.com/mamaclapper/StremioX/issues).
+What is planned next is in [ROADMAP.md](ROADMAP.md). To request a feature or report a bug, start a [GitHub Discussion](https://github.com/mamaclapper/VortX/discussions) or [open an issue](https://github.com/mamaclapper/VortX/issues).
 
 ## 0.3.5 - 2026-06-15
 
-StremioX is now VortX. This release puts on the new name, a new gold-on-obsidian icon, and an animated VortX intro, and it adds Backup & Restore so your settings can travel with you. It is an in-place update: your library, add-ons, history, and settings stay exactly as they are. Two reliability fixes ride along.
+StremioX is now VortX. This release puts on the new name, a new gold-on-obsidian icon, and an animated VortX intro, and it adds Backup & Restore so your settings can travel with you. It is an in-place update: your library, add-ons, history, and settings stay exactly as they are. A handful of player and Apple TV fixes ride along too, including a smarter best-stream picker.
 
 ### Added
 - **The app is now VortX.** A new name, a new gold-on-obsidian app icon, and an animated VortX launch screen on iPhone, iPad, Mac, and Apple TV. Same app and same account underneath, so nothing resets.
@@ -15,6 +15,9 @@ StremioX is now VortX. This release puts on the new name, a new gold-on-obsidian
 ### Fixed
 - **The Apple TV "Up Next" prompt shows reliably at the end of an episode.** It now takes the corner the moment the credits begin, in place of the old Skip Credits button, so Play Now and Watch Credits are always there when you reach for them, and the buttons no longer wrap or look uneven.
 - **The streaming server holds up better under load.** The in-app server gets a larger background worker pool, so busy moments (a torrent and subtitles fetching at once) are less likely to stall it.
+- **Best stream is smarter: a true remux now beats a merely bigger file.** The picker ranks source type (remux over Blu-ray over web) and HDR/Dolby Vision and audio above raw file size, with size only breaking ties, so the highest-quality source wins instead of just the largest.
+- **The Apple TV "All sources" list scrolls all the way down again** even when the first entry is a non-playable one (like a Ratings add-on).
+- **The Apple TV top menu bar comes back reliably** after returning from the Home screen or switching profiles, instead of occasionally staying hidden.
 
 ### Notes
 - Next up is VortX in full: the repository and docs move to the new name, with a website, a subreddit, and a Discord to follow.

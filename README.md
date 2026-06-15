@@ -272,7 +272,7 @@ It started out talking to add-ons by hand, and that kept getting small things wr
 
 With native apps across Apple now shipping, the work moves outward and deeper: finishing the desktop (Windows, Linux, Mac via Tauri) and Android (phone and TV) builds on the shared engine, stream intelligence (a trust filter, keyword filters, built-in debrid), offline downloads, a full Live TV channel guide, and — on the path to 1.0 — StremioX's own engine, streaming server, ranking, and metadata, with a new identity at 1.0. The full plan is in [ROADMAP.md](ROADMAP.md). Every released change is tracked in [CHANGELOG.md](CHANGELOG.md).
 
-Have a feature in mind, or hit a bug? Start a [GitHub Discussion](https://github.com/mamaclapper/StremioX/discussions) to suggest or talk through an idea, or [open an issue](https://github.com/mamaclapper/StremioX/issues). Requests genuinely shape the roadmap.
+Have a feature in mind, or hit a bug? Start a [GitHub Discussion](https://github.com/mamaclapper/VortX/discussions) to suggest or talk through an idea, or [open an issue](https://github.com/mamaclapper/VortX/issues). Requests genuinely shape the roadmap.
 
 ## Known issues
 
@@ -302,9 +302,9 @@ The Full IPAs include `server.js`, the streaming server's own proprietary file, 
 
 <a href="https://www.star-history.com/?repos=mamaclapper%2FStremioX&type=date&legend=top-left">
  <picture>
-   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=mamaclapper/StremioX&type=date&theme=dark&legend=top-left" />
-   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=mamaclapper/StremioX&type=date&legend=top-left" />
-   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=mamaclapper/StremioX&type=date&legend=top-left" />
+   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=mamaclapper/VortX&type=date&theme=dark&legend=top-left" />
+   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=mamaclapper/VortX&type=date&legend=top-left" />
+   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=mamaclapper/VortX&type=date&legend=top-left" />
  </picture>
 </a>
 
