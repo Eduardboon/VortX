@@ -140,17 +140,18 @@ export interface Session {
 }
 
 // --- Session persistence ------------------------------------------------------------------------
-// The token + account + data key are kept in localStorage so login survives navigation and reloads.
-// The data key only unlocks THIS account's blob; sign-out clears it. The key name is shared with the
-// other surfaces' web clients on this origin and must not change.
+// The token + account stay in localStorage so login survives navigation and reloads. The AES data key
+// (which decrypts the WHOLE account) is kept in sessionStorage instead, so it is wiped when the tab/browser
+// closes and a fresh tab re-derives it from the password/QR. This shrinks the master key's exposure to the
+// lifetime of a tab (XSS or a malicious extension can no longer lift a key that persists forever). Matches
+// the vortx.tv dashboard. SESSION_KEY is shared across this origin's web clients and must not change.
 const SESSION_KEY = "vortx.session.v1";
+const DATAKEY_KEY = "vortx.dk.v1";
 
 export function saveSession(s: Session): void {
   try {
-    localStorage.setItem(
-      SESSION_KEY,
-      JSON.stringify({ token: s.token, account: s.account, dataKey: b64(s.dataKey) }),
-    );
+    localStorage.setItem(SESSION_KEY, JSON.stringify({ token: s.token, account: s.account }));
+    sessionStorage.setItem(DATAKEY_KEY, b64(s.dataKey));
   } catch {
     // Private-mode / quota: the in-memory session still works for this tab.
   }
@@ -160,8 +161,19 @@ export function loadSession(): Session | null {
     const raw = localStorage.getItem(SESSION_KEY);
     if (!raw) return null;
     const o = JSON.parse(raw) as { token?: string; account?: Account; dataKey?: string };
-    if (!o?.token || !o?.account || !o?.dataKey) return null;
-    return { token: o.token, account: o.account, dataKey: unb64(o.dataKey) };
+    if (!o?.token || !o?.account) return null;
+    let dk = sessionStorage.getItem(DATAKEY_KEY);
+    // One-time migration off the legacy localStorage data key: move it to sessionStorage, then strip it
+    // from localStorage so the master key no longer persists across tab closes.
+    if (!dk && typeof o.dataKey === "string") {
+      dk = o.dataKey;
+      try {
+        sessionStorage.setItem(DATAKEY_KEY, dk);
+        localStorage.setItem(SESSION_KEY, JSON.stringify({ token: o.token, account: o.account }));
+      } catch { /* keep the in-memory session for this tab */ }
+    }
+    if (!dk) return null; // token present but key gone (tab was closed): re-login to re-derive it
+    return { token: o.token, account: o.account, dataKey: unb64(dk) };
   } catch {
     return null;
   }
@@ -169,6 +181,7 @@ export function loadSession(): Session | null {
 export function clearSession(): void {
   try {
     localStorage.removeItem(SESSION_KEY);
+    sessionStorage.removeItem(DATAKEY_KEY);
   } catch {
     // Nothing to do: a failed remove leaves a stale blob that the next load tolerates.
   }
