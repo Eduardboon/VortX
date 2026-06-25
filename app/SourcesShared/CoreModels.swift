@@ -475,6 +475,10 @@ struct CoreDiscover: Decodable {
     let selectable: CoreDiscoverSelectable
     let catalog: [CoreCatalogPage]          // Vec<ResourceLoadable<Vec<MetaItemPreview>>> (pages)
     var items: [CoreMeta] { catalog.compactMap { $0.content?.ready }.flatMap { $0 } }
+    /// True while any catalog page is still loading (e.g. a just-dispatched next-page request). Lets the
+    /// bridge tell a mid-load emit (same item count, more coming) apart from a settled end-of-catalog
+    /// (load finished with no new items), so cursorless-pagination end-detection never latches early.
+    var isLoadingPage: Bool { catalog.contains { $0.content?.isLoading == true } }
 }
 
 struct CoreDiscoverSelectable: Decodable {
