@@ -260,16 +260,24 @@ final class MPVMetalViewController: PlatformViewController {
             try session.setActive(true)
             // Read the route FIRST: the multichannel decision below depends on it.
             outputPortType = session.currentRoute.outputs.first?.portType
+            // #78 DIAGNOSTIC: the reporter's Apple TV is silent under Dolby Atmos but plays fine under Dolby
+            // Digital 5.1, and there is no Atmos hardware here to reproduce against. Log the route's port
+            // type, intrinsic max channels, and rate in BOTH states so the discriminator (what the session
+            // reports differently under Atmos vs working 5.1) is visible in the device log. Read the
+            // intrinsic max BEFORE opting into multichannel content, so it reflects the route itself.
+            let intrinsicMaxChannels = session.maximumOutputNumberOfChannels
+            NSLog("[#78 audio] route=\(outputPortType?.rawValue ?? "nil") maxOutChannels=\(intrinsicMaxChannels) sampleRate=\(session.sampleRate)")
             // #88 / #78: advertise multichannel content ONLY on routes that can actually OPEN a multichannel
-            // layout — AirPods (system head-tracked Spatial Audio) and real receivers over HDMI/eARC. On the
-            // TV's built-in speakers / AirPlay with the system audio format set to Atmos / Best-Available,
-            // advertising multichannel makes the session present a spatial format that mpv's audiounit AO
-            // CANNOT open, so it falls back to the null AO and the movie is SILENT — even when the viewer
-            // picks Stereo, because the AO never opens before the channel choice matters (#78 reporter,
-            // Beta 5 still silent). Keeping those routes on a plain stereo session lets the AO open and play.
-            // Set before reading the channel count so `maximumOutputNumberOfChannels` reflects the decision.
+            // layout. AirPods take a system head-tracked Spatial Audio layout. For wired/receiver routes we
+            // now drive this off the route's OWN reported capability (intrinsic max > 2) instead of trusting
+            // the port type alone: an Apple TV outputs over HDMI and reports `.HDMI` even when its system
+            // audio format is plain stereo or an Atmos layout the audiounit AO cannot open, which advertised
+            // multichannel and left the movie SILENT (#78). A route reporting only 2 intrinsic channels now
+            // stays stereo so the AO opens. Forced stereo routes (TV built-in speakers / AirPlay) stay stereo
+            // exactly as before, preserving the working path.
+            let routeIsMultichannelCapable = !routeIsStereoOnly && (routeIsAirPods || intrinsicMaxChannels > 2)
             if #available(iOS 15.0, tvOS 15.0, *) {
-                try? session.setSupportsMultichannelContent(!routeIsStereoOnly)
+                try? session.setSupportsMultichannelContent(routeIsMultichannelCapable)
             }
             outputChannels = max(session.maximumOutputNumberOfChannels, 2)
             outputSampleRate = session.sampleRate
@@ -439,12 +447,21 @@ final class MPVMetalViewController: PlatformViewController {
         if !routeIsStereoOnly, !routeIsAirPods, let spdif = AudioOutputMode.current.spdifCodecs {
             checkError(mpv_set_option_string(mpv, "audio-spdif", spdif))
         }
-        // AO-open failure handling, route-aware. On a real external route (HDMI/ARC/eARC, USB, line
-        // out) keep `no` so a soundbar mis-negotiation surfaces as a log instead of silent death and
-        // stays diagnosable. On a stereo-only route (TV built-in / AirPlay) the failure mode is the
-        // user being stranded silent or the file freezing, so allow the null AO: playback keeps
-        // running (video continues) instead of wedging, the graceful fallback for #78.
-        checkError(mpv_set_option_string(mpv, "audio-fallback-to-null", routeIsStereoOnly ? "yes" : "no"))
+        // AO-open failure handling, route-aware. On a stereo-only route (TV built-in / AirPlay) the
+        // failure mode is the user being stranded silent or the file freezing, so allow the null AO:
+        // playback keeps running (video continues) instead of wedging, the graceful fallback for #78.
+        // #78 SAFETY NET: tvOS always outputs over HDMI to a TV / AVR, and the reported Atmos failure is
+        // the audiounit AO failing to open the negotiated layout -> silent + frozen. Allow the null AO on
+        // every tvOS route too, so a failed open degrades to no-audio-but-video-keeps-playing instead of a
+        // dead player. This is the lowest-risk mitigation; it does not change a route where the AO opens
+        // fine (working 5.1 / stereo keep their audio). iOS/macOS keep `no` on a real external route so a
+        // soundbar mis-negotiation still surfaces as a diagnosable log rather than silently dropping audio.
+        #if os(tvOS)
+        let fallbackToNull = "yes"
+        #else
+        let fallbackToNull = routeIsStereoOnly ? "yes" : "no"
+        #endif
+        checkError(mpv_set_option_string(mpv, "audio-fallback-to-null", fallbackToNull))
         // THE soundbar fix: resample to the route's actual rate so a rate mismatch over a fixed-rate
         // HDMI-ARC link can't drop to silence (mpv's audiounit AO does not resample to the route).
         if let rate = sampleRatePolicy {
