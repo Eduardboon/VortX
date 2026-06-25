@@ -757,6 +757,13 @@ final class VortXSyncManager: ObservableObject {
     private var pendingSync: Task<Void, Never>?
     func requestSyncSoon() {
         guard isSignedIn else { return }
+        // Universal "do not schedule a push from this write" gate. While syncDown is applying a remote pull
+        // (isApplyingRemote), the writes it makes must NOT arm a push, or the receiving device re-pushes the
+        // peer values and starves its own pull guard (the Beta 8/9 settings-sync starvation). The
+        // UserDefaults.didChangeNotification observer already checks this, but apiKeys (ApiKeys.didSet) and
+        // debrid keys (DebridKeys.setKey) call requestSyncSoon() DIRECTLY, bypassing the observer, so the gate
+        // must live here too to cover every call path. A genuine user edit never runs inside the apply window.
+        guard !isApplyingRemote else { return }
         hasPendingPush = true
         pendingSync?.cancel()
         pendingSync = Task { [weak self] in
