@@ -16,6 +16,7 @@ struct SettingsView: View {
     /// In-app UI language (tvOS had no picker before). "system" follows the Apple TV language.
     @State private var langSelection: String = AppLanguage.current ?? "system"
     @State private var showLangRestart = false
+    @AppStorage("stremiox.hideLiveTab") private var hideLiveTab = false
     @AppStorage(SubtitleStyle.Key.font) private var subFont = SubtitleStyle.defaultFont
     @AppStorage(SubtitleStyle.Key.size) private var subSize = SubtitleStyle.defaultSize
     @AppStorage(SubtitleStyle.Key.sizeScale) private var subSizeScale = 1.0
@@ -374,6 +375,11 @@ struct SettingsView: View {
                     showLangRestart = true
                 }))
             Text("Switches the whole app to this language. VortX must quit and reopen to apply it.")
+                .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
+
+            choiceRow("Live TV tab", [("1", "Show"), ("0", "Hide")],
+                      selection: Binding(get: { hideLiveTab ? "0" : "1" }, set: { hideLiveTab = ($0 == "0") }))
+            Text("Hide the Live TV tab if you do not use it.")
                 .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
 
             choiceRow("Dolby Vision / HDR", [("auto", "Auto"), ("on", "Tone-map to SDR"), ("off", "Always HDR")], selection: $hdrToneMapMode)

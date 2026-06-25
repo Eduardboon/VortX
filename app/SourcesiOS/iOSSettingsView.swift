@@ -47,6 +47,7 @@ struct iOSSettingsView: View {
     @AppStorage(PerformanceMode.overrideKey) private var perfMode = "auto"
     @AppStorage(AudioOutputMode.key) private var audioOutput = AudioOutputMode.auto.rawValue
     @AppStorage(PlaybackSettings.Key.videoUpscaling) private var videoUpscaling = PlaybackSettings.videoUpscaling.rawValue
+    @AppStorage("stremiox.hideLiveTab") private var hideLiveTab = false
     #if os(iOS) || os(macOS)
     @AppStorage(PlayerEngineRouter.overrideKey) private var playerEngine = PlayerEngineRouter.Override.auto.rawValue
     #endif
@@ -765,6 +766,8 @@ struct iOSSettingsView: View {
                 Text("Reduced").tag("reduced")
             }
             .pickerStyle(.segmented)
+
+            Toggle("Show Live TV tab", isOn: Binding(get: { !hideLiveTab }, set: { hideLiveTab = !$0 }))
         } header: {
             Text("Appearance")
         } footer: {

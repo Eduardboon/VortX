@@ -69,6 +69,9 @@ struct iOSRootView: View {
     /// when a still-newer build ships.
     @ObservedObject private var updates = UpdateChecker.shared
     @AppStorage("stremiox.update.dismissedVersion") private var dismissedUpdateVersion = ""
+    /// Hide the Live TV tab for users who do not use it (Settings toggle). The Live screen is not mounted
+    /// and the tab is dropped from the bar; selection falls back to Home if it was on Live.
+    @AppStorage("stremiox.hideLiveTab") private var hideLiveTab = false
     @Environment(\.openURL) private var openURL
     /// Post-update highlights, shown once when the build increases (never on a fresh install). See WhatsNew.
     @State private var showWhatsNew = false
@@ -85,7 +88,7 @@ struct iOSRootView: View {
                 // Only the visible tab contributes its wordmark (#46 regression).
                 iOSHomeView(isActive: tab == .home).opacity(tab == .home ? 1 : 0)
                 iOSDiscoverView(isActive: tab == .discover).opacity(tab == .discover ? 1 : 0)
-                iOSLiveView().opacity(tab == .live ? 1 : 0)
+                if !hideLiveTab { iOSLiveView().opacity(tab == .live ? 1 : 0) }
                 iOSLibraryView(isActive: tab == .library).opacity(tab == .library ? 1 : 0)
                 iOSSearchView(isActive: tab == .search).opacity(tab == .search ? 1 : 0)
                 AddonsView().opacity(tab == .addons ? 1 : 0)
@@ -105,6 +108,9 @@ struct iOSRootView: View {
         // hourly re-check finds a still-newer one), so users learn about updates without opening Settings.
         .sheet(item: $updates.prompt) { release in
             UpdatePromptView(release: release) { updates.dismissPrompt() }
+        }
+        .onChange(of: hideLiveTab) { hidden in
+            if hidden, tab == .live { tab = .home }   // never leave the bar pointing at a hidden screen
         }
         .onAppear {
             WhatsNew.recordFreshInstallIfNeeded()
@@ -129,9 +135,14 @@ struct iOSRootView: View {
     /// Brand-styled bottom bar: seven equal items, each a small SF Symbol over a caption label. The
     /// selected item is tinted with the app accent; the rest read as tertiary text. A hairline +
     /// surface fill separates it from the content, and it respects the safe-area bottom inset.
+    /// Tabs shown in the bar; the Live tab is dropped when the user hides it in Settings.
+    private var visibleTabs: [Tab] {
+        hideLiveTab ? Tab.allCases.filter { $0 != .live } : Tab.allCases
+    }
+
     private var customTabBar: some View {
         HStack(spacing: 0) {
-            ForEach(Tab.allCases, id: \.rawValue) { item in
+            ForEach(visibleTabs, id: \.rawValue) { item in
                 tabButton(item)
             }
         }

@@ -255,6 +255,8 @@ struct RootTabView: View {
     // its root instead of re-showing the detail page you had pushed (the "Search still shows the
     // series I opened" bug). Cheap because the data lives in CoreBridge, not in the view.
     @State private var resetTokens = [Int](repeating: 0, count: 7)
+    /// Hide the Live TV tab for users who do not use it (Settings toggle).
+    @AppStorage("stremiox.hideLiveTab") private var hideLiveTab = false
 
     var body: some View {
         TabView(selection: $selection) {
@@ -265,8 +267,10 @@ struct RootTabView: View {
             // Live TV sits after Discover. Tags 0–5 were already taken (Search uses 4, Add-ons 3),
             // so Live takes the next free tag 6 and reset slot 6 — the selection-reset .onChange
             // below stays in bounds against the resized 7-slot array.
-            LiveView().id(resetTokens[6])
-                .tabItem { Label("Live", systemImage: "dot.radiowaves.left.and.right") }.tag(6)
+            if !hideLiveTab {
+                LiveView().id(resetTokens[6])
+                    .tabItem { Label("Live", systemImage: "dot.radiowaves.left.and.right") }.tag(6)
+            }
             LibraryView().id(resetTokens[2])
                 .tabItem { Label("Library", systemImage: "books.vertical.fill") }.tag(2)
             NavigationStack { SearchView() }.id(resetTokens[4])
@@ -289,6 +293,11 @@ struct RootTabView: View {
         // Reset the tab being LEFT to its root, so returning to it lands on the root page.
         .onChange(of: selection) { old, _ in
             if old >= 0, old < resetTokens.count { resetTokens[old] += 1 }
+        }
+        // If Live is hidden while it was the selected tab (e.g. synced from another device), fall back to Home
+        // so the TabView never points at a tag that no longer exists.
+        .onChange(of: hideLiveTab) { _, hidden in
+            if hidden, selection == 6 { selection = 0 }
         }
         // The active profile owns the theme: mirror Settings changes into it so they survive a switch.
         .onChange(of: theme.accentID) { applyTabBarAccent(); ProfileStore.shared.captureTheme() }
