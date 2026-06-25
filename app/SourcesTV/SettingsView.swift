@@ -145,11 +145,10 @@ struct SettingsView: View {
 
     @ViewBuilder private var accountSection: some View {
         section("Account") {
-            // The whole account block is one focus section so Down keeps stepping DOWN through
-            // its stacked rows instead of leaving after the first hit. "Log Out" sits far right
-            // (after a Spacer) while the rows below it are left-aligned; without this grouping
-            // the downward beam from Log Out misses the left-aligned links and the engine exits
-            // the section, skipping "VortX account & sync" and the metadata-keys row.
+            // The whole account block is one focus section so Down keeps stepping DOWN through its
+            // stacked rows instead of leaving after the first hit. Every focusable row (including the
+            // Log Out button below) is left-aligned and full-width, so the spatial focus engine's
+            // downward beam stays in-column and never skips a row.
             VStack(alignment: .leading, spacing: Theme.Space.md) {
                 // Lead with the VortX account (the app's own E2E account + sync); the Stremio account sits beneath.
                 NavigationLink { SyncSettingsView() } label: {
@@ -157,6 +156,12 @@ struct SettingsView: View {
                 }
                 .buttonStyle(ChipButtonStyle(selected: false))
                 if account.isSignedIn {
+                    // Identity is a non-focusable info row; Log Out is its OWN full-width row directly
+                    // BELOW it, in the same left-aligned column as every other account row. The old layout
+                    // stranded Log Out far-right after a Spacer(), so the spatial focus engine's downward
+                    // beam from the left-aligned rows missed it and the owner could not reach it on tvOS.
+                    // Stacking it in-column makes it a deterministic D-pad target (down lands on it, then
+                    // continues to the rows below). The .focusSection() on the enclosing VStack stays.
                     HStack(spacing: Theme.Space.md) {
                         Image(systemName: "person.crop.circle.fill")
                             .font(.system(size: 52)).foregroundStyle(Theme.Palette.accent)
@@ -165,12 +170,13 @@ struct SettingsView: View {
                             Text("Stremio · \(account.addons.count) add-ons · \(account.streamAddonBases.count) stream sources")
                                 .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
                         }
-                        Spacer()
-                        Button { account.signOut(); core.logOut() } label: {
-                            Label("Log Out", systemImage: "rectangle.portrait.and.arrow.right")
-                        }
-                        .buttonStyle(ChipButtonStyle(selected: true, accent: Theme.Palette.danger, accentText: Theme.Palette.danger))
+                        Spacer(minLength: 0)
                     }
+                    Button { account.signOut(); core.logOut() } label: {
+                        Label("Log Out", systemImage: "rectangle.portrait.and.arrow.right")
+                    }
+                    .buttonStyle(ChipButtonStyle(selected: true, accent: Theme.Palette.danger, accentText: Theme.Palette.danger))
+                    .frame(maxWidth: .infinity, alignment: .leading)
                 } else {
                     NavigationLink { LoginView(account: account) } label: {
                         Label("Sign in to your Stremio account", systemImage: "person.crop.circle")
