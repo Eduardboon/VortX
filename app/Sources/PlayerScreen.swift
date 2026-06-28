@@ -2034,7 +2034,14 @@ struct PlayerScreen: View {
     @MainActor private func leavePlayback() {
         hideTask?.cancel(); loadTimeout?.cancel(); autoRetryTask?.cancel()
         stallWatchdog?.cancel(); recoveryDeadline?.cancel(); skipFetchTask?.cancel()
-        if !effectivelyLive, duration > 0 { onProgress(currentTime, duration) }
+        if !effectivelyLive, duration > 0 {
+            onProgress(currentTime, duration)
+            // A manual close at/near the end must clear Continue Watching too, not only a natural EOF. The
+            // engine keeps any item with time_offset > 0 in the rail, so a title watched to the credits then
+            // closed by hand would linger there forever (the "CW never clears" report). Rewind it OUT of CW,
+            // mirroring the EOF branch; 0.9 is the engine's own CREDITS threshold.
+            if let m = curMeta, currentTime / duration >= 0.9 { core.finishedWatching(libraryId: m.libraryId) }
+        }
         onClose()
     }
 
