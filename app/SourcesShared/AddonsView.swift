@@ -99,7 +99,7 @@ struct AddonsView: View {
     @State private var installing = false
     @State private var installMessage: String?
     @State private var installFailed = false
-    @State private var configuring: CoreDescriptor?   // the add-on whose Configure sheet is open
+    @State private var addonSheet: AddonSheet?   // the per-add-on Configure / Change-URL sheet
 
     var body: some View {
         NavigationStack {
@@ -146,7 +146,12 @@ struct AddonsView: View {
             }
             .background(Theme.Palette.canvas.ignoresSafeArea())
             .task(id: core.addons.count) { health.probe(core.addons.map(\.transportUrl)) }
-            .sheet(item: $configuring) { ConfigureAddonView(addon: $0) }
+            .sheet(item: $addonSheet) { sheet in
+                switch sheet {
+                case .configure(let a): ConfigureAddonView(addon: a)
+                case .editURL(let a): EditAddonURLView(addon: a)
+                }
+            }
         }
     }
 
@@ -233,11 +238,16 @@ struct AddonsView: View {
             // Configurable add-ons (Torrentio, debrid configs, …) expose a web settings page. Available
             // regardless of protected state; protected defaults are not configurable anyway.
             if addon.isConfigurable {
-                Button { configuring = addon } label: { Label("Configure", systemImage: "slider.horizontal.3") }
+                Button { addonSheet = .configure(addon) } label: { Label("Configure", systemImage: "slider.horizontal.3") }
                     .buttonStyle(ChipButtonStyle(selected: false))
                     .fixedSize()
             }
             if !addon.isProtected {
+                // Change the add-on's manifest URL in place (e.g. after reconfiguring it): installs the new
+                // URL first, then removes the old, so a bad URL never leaves you with neither.
+                Button { addonSheet = .editURL(addon) } label: { Image(systemName: "link") }
+                    .buttonStyle(ChipButtonStyle(selected: false))
+                    .fixedSize()
                 // Per-profile on/off (local overlay). Distinct from Remove, which uninstalls account-wide.
                 Button { profiles.toggleAddon(base: addon.transportUrl) } label: {
                     Image(systemName: isOff ? "eye.slash" : "eye")
@@ -330,4 +340,86 @@ private struct ConfigureAddonView: View {
         return CIContext().createCGImage(scaled, from: scaled.extent)
     }
     #endif
+}
+
+/// Which per-add-on sheet is open (Configure or Change-URL). One sheet binding avoids SwiftUI's
+/// multiple-`.sheet` conflict.
+private enum AddonSheet: Identifiable {
+    case configure(CoreDescriptor)
+    case editURL(CoreDescriptor)
+    var id: String {
+        switch self {
+        case .configure(let a): return "cfg-" + a.transportUrl
+        case .editURL(let a): return "url-" + a.transportUrl
+        }
+    }
+}
+
+/// Change an installed add-on's manifest URL in place, e.g. after reconfiguring it (a configurable add-on
+/// hands back a NEW URL with your options baked in). Installs the new URL FIRST, then removes the old, so
+/// a failed install never leaves you with neither add-on.
+private struct EditAddonURLView: View {
+    let addon: CoreDescriptor
+    @Environment(\.dismiss) private var dismiss
+    @State private var url: String
+    @State private var working = false
+    @State private var message: String?
+
+    init(addon: CoreDescriptor) {
+        self.addon = addon
+        _url = State(initialValue: addon.transportUrl)
+    }
+
+    var body: some View {
+        VStack(spacing: Theme.Space.lg) {
+            VStack(spacing: Theme.Space.xs) {
+                Text("Change add-on URL").font(.title2).fontWeight(.bold)
+                    .foregroundStyle(Theme.Palette.textPrimary)
+                Text(addon.manifest.name).font(.subheadline)
+                    .foregroundStyle(Theme.Palette.textSecondary)
+            }
+            Text("Replace this add-on's manifest URL, for example after reconfiguring it. The new URL is installed first, then the old one removed.")
+                .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
+                .multilineTextAlignment(.center).frame(maxWidth: 520)
+            TextField("https://…/manifest.json", text: $url)
+                .font(.system(size: 16, design: .monospaced))
+                .disableAutocorrection(true)
+                .frame(maxWidth: 560)
+            if let message {
+                Text(message).font(Theme.Typography.label).foregroundStyle(Theme.Palette.danger)
+                    .multilineTextAlignment(.center)
+            }
+            HStack(spacing: Theme.Space.md) {
+                Button("Cancel") { dismiss() }
+                    .buttonStyle(.bordered)
+                    .tint(Theme.Palette.textPrimary)
+                    .foregroundStyle(Theme.Palette.textPrimary)
+                Button(working ? "Updating…" : "Update") { update() }
+                    .buttonStyle(PrimaryActionStyle())
+                    .disabled(working || url.trimmingCharacters(in: .whitespaces).isEmpty || url == addon.transportUrl)
+            }
+        }
+        .padding(Theme.Space.xl)
+        #if os(macOS)
+        .frame(width: 520)
+        .background(Theme.Palette.canvas)
+        #else
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(Theme.Palette.canvas.ignoresSafeArea())
+        #endif
+    }
+
+    private func update() {
+        working = true
+        message = nil
+        let newURL = url.trimmingCharacters(in: .whitespaces)
+        Task { @MainActor in
+            if let error = await CoreBridge.shared.installAddon(urlString: newURL) {
+                message = error; working = false; return
+            }
+            CoreBridge.shared.uninstallAddon(addon)
+            working = false
+            dismiss()
+        }
+    }
 }
