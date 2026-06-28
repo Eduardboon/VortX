@@ -346,6 +346,21 @@ struct iOSHomeView: View {
         }
         macFocus = .card(rail: rails[r].title, item: rails[r].ids[i])
     }
+
+    /// Changes whenever the Home rails gain/lose content, so focus-seeding can retry once rails hydrate.
+    private var macRailSeedKey: Int {
+        continueWatchingItems.count + topPicks.items.count + core.boardRows.count
+            + (showCuratedRails ? curated.collections.count : 0)
+    }
+
+    /// Seed keyboard focus onto the first card once the rails exist, so a card is the first responder and the
+    /// ScrollView's `.onMoveCommand` actually receives arrows. Without a seeded responder macOS has nothing
+    /// focused at launch and arrows do nothing (the "Mac arrow-key nav dead" report). Idempotent: seeds only
+    /// when nothing is focused yet, once rails have hydrated.
+    private func seedMacFocusIfNeeded() {
+        guard macFocus == nil, let first = macRails.first, let firstID = first.ids.first else { return }
+        macFocus = .card(rail: first.title, item: firstID)
+    }
     #endif
 
     /// The hero's rotation pool: the first ~2-3 of Continue Watching, then the first items of the top
@@ -464,6 +479,10 @@ struct iOSHomeView: View {
                     hero.noteInteraction()
                 }
             }
+            // Seed focus onto the first card so a responder exists and arrows start moving: once on appear,
+            // and again when the rails first hydrate (boardRows / CW arrive async after onAppear).
+            .onAppear { seedMacFocusIfNeeded() }
+            .onChange(of: macRailSeedKey) { _ in seedMacFocusIfNeeded() }
             #endif
             .background(Theme.Palette.canvas.ignoresSafeArea())
             .stremioWordmarkTitle(String(localized: "Home"), isActive: isActive)
@@ -1693,11 +1712,10 @@ private struct PosterRail: View {
                     if showArrows && pageIndex < items.count - 1 { railArrow(forward: true) { page(by: 1, proxy) } }
                 }
             }
-            #if os(macOS)
-            // Group the rail's cards so native directional focus resolves Left/Right WITHIN the row and
-            // Up/Down BETWEEN rows geometrically, only when this rail opts into keyboard focus (Home).
-            .modifier(MacRailFocusSection(enabled: macFocus != nil))
-            #endif
+            // NOTE: the per-rail `.focusSection()` (MacRailFocusSection) was removed - it grouped cards for
+            // NATIVE geometric arrow nav, which CONSUMED arrows before they could bubble to the ScrollView's
+            // `.onMoveCommand` (advanceMacFocus). With it gone, advanceMacFocus is the single arrow-movement
+            // authority and cards stay `.focusable()` only to show the ring. (Mac arrow-key nav; device-verify.)
         }
         .onHover { hovering = $0 }
     }
