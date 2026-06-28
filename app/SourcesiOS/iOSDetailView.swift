@@ -363,15 +363,19 @@ struct iOSDetailView: View {
         guard let m = meta else { return }
         let title = "\(m.name) Trailer"
         let req = TrailerRequest.from(meta: m)
-        // A direct (non-YouTube) trailer stream plays in the native player. A YouTube trailer plays via the
-        // keyless IFrame embed (the reliable official-Stremio path), resolving the id from the engine meta
-        // or the Cinemeta/TMDB fallback. No /yt scraping, so it works even on the Lite (no-server) build.
+        // A direct (non-YouTube) trailer stream plays in the native player. A YouTube trailer is resolved
+        // to a direct stream by the embedded server's /yt InnerTube route and ALSO plays in libmpv (the
+        // inline path the rest of the ecosystem uses, not a fragile IFrame embed that hits YouTube's
+        // embed-Referer 152 error). The id comes from the engine meta or the Cinemeta/TMDB fallback. On
+        // the Lite (no-server) build playableURL is nil, so it hands off to the YouTube app/browser.
         if let direct = req?.directURL {
             presentation = .trailerPlayer(url: direct, title: title)
         } else if let yt = req?.youTubeID ?? resolvedTrailerID, !yt.isEmpty {
-            presentation = .trailerEmbed(youTubeID: yt, title: title)
-        } else if let watch = req?.watchURL {
-            TrailerOpener.open(watch)   // last resort: hand off to the YouTube app / browser
+            if let url = TrailerRequest(title: title, youTubeID: yt, directURL: nil).playableURL {
+                presentation = .trailerPlayer(url: url, title: title)
+            } else if let watch = URL(string: "https://www.youtube.com/watch?v=\(yt)") {
+                TrailerOpener.open(watch)   // Lite (no embedded server): hand off to the YouTube app / browser
+            }
         }
     }
 
