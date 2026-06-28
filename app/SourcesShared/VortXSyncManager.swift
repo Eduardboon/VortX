@@ -361,7 +361,7 @@ final class VortXSyncManager: ObservableObject {
         // flags to InstallAddon without a fetch. dash-ui keeps reading transportUrl/name (extra keys are
         // additive and ignored). The Stremio token never enters this; only descriptors do (they already
         // ride doc.addons + apiKeys E2E today).
-        let engineAddons: [[String: Any]] = CoreBridge.shared.rawAddonDescriptors().compactMap { raw in
+        let engineAddons: [[String: Any]] = CoreBridge.shared.rawAddonDescriptorsOrdered().compactMap { raw in
             guard let url = raw["transportUrl"] as? String, !url.isEmpty else { return nil }
             var entry = raw
             // The dashboard reads `name`; lift it out of the manifest so the old summary shape is a subset.

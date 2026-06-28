@@ -170,6 +170,13 @@ final class CoreBridge: ObservableObject {
         Array(rawAddonsByUrl.values)
     }
 
+    /// Same descriptors as `rawAddonDescriptors`, but in the engine's TRUE install order (the typed `addons`
+    /// Vec order) instead of the nondeterministic dictionary order, so the sync layer can persist + round-trip
+    /// the user's add-on PRIORITY: a reorder on one device reaches the others via doc.vortx.addons.
+    func rawAddonDescriptorsOrdered() -> [[String: Any]] {
+        addons.compactMap { rawAddonsByUrl[$0.transportUrl] }
+    }
+
     /// Install the VortX account's owned add-ons back INTO the engine, but ONLY descriptors the engine
     /// lacks (idempotent). This is the load-bearing "account owns everything" capability: it lets a
     /// logged-out / degraded Stremio session show the account's add-ons + sources instead of zero.
@@ -204,7 +211,16 @@ final class CoreBridge: ObservableObject {
     private func bootstrapAuth() {
         if isLoggedIn() {
             refreshFromAPI()
-            loadBoard() // addons already hydrated from the engine's own storage
+            // VortX-first (account-owns-everything): hydrate the VortX account's owned add-ons into the engine
+            // on EVERY launch, not only when degraded, so doc.vortx.addons is the source of truth and a still-
+            // valid Stremio session reconciles ON TOP of it rather than the engine's Stremio-sourced storage
+            // being the sole source. Idempotent + never-zero guarded inside the sync manager (installs only the
+            // missing owned add-ons), so a healthy engine is a no-op and a failed/empty account pull does nothing.
+            Task { @MainActor in
+                await VortXSyncManager.shared.hydrateEngineFromOwnedAddons()
+                self.loadBoard()
+            }
+            loadBoard() // refresh the board now too; addons were already hydrated from the engine's own storage
             return       // scheduleSessionRepair() is now called once from start() for ALL paths
         }
         guard let key = Keychain.string(activeTokenAccount), !key.isEmpty else {
