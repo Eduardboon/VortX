@@ -12,7 +12,7 @@ The Beta 11 follow-up. A focused pass on the bugs you reported: trailers that ac
 
 - **Trailers play the real trailer again, on iPhone, iPad, and Mac.** The Trailer button was loading a fragile path that often failed and then fell through to playing the actual movie. It now plays the official YouTube trailer inside the app the way the rest of the ecosystem does, and it finds a trailer for many more titles (it also looks them up on TMDB now). Apple TV is unchanged.
 - **Finished titles leave Continue Watching.** A movie or episode watched to the end and then closed by hand used to stay in the row at its end position. It clears now, the same as when it plays out on its own.
-- **Resuming from Continue Watching works far more often.** A torrent resumed straight from the Continue Watching row often showed "sources didn't load" and made you reopen the title and pick a source again. The resume now re-arms the torrent with working trackers first, so it starts on its own.
+- **Resuming from Continue Watching works far more often.** A title resumed straight from the Continue Watching row often showed "sources didn't load" and made you reopen it and pick a source again, most often with debrid, whose links expire between sessions. The resume now loads fresh sources in the background and, if the saved link has expired, switches to a working one on its own.
 - **The resolution label is right on widescreen 4K.** A cinematic 4K film (a wide 2.40:1 frame) was labeled 1440p because the label read the picture height. It reads the width now, so 4K shows as 4K.
 - **A tiny file can no longer pose as 4K.** A small stream that merely carries "2160p" or "4K" in its title is no longer trusted as real 4K, so it stops topping the source list and showing a 4K badge it cannot back up.
 - **Mac: arrow keys move the selection on Home.** The keyboard highlight used to appear on a clicked card and then sit there; the arrow keys now move it across a row and between rows.
@@ -20,6 +20,7 @@ The Beta 11 follow-up. A focused pass on the bugs you reported: trailers that ac
 ### Added
 
 - **Hide the built-in Home rows.** The editorial rows (Critically Acclaimed, Hidden Gems, Modern Classics, Award Winners) are built in and used to show no matter what. A new switch in Settings, Appearance, "Show editorial Home rows," turns them off.
+- **SkipDB for skip timestamps.** A new open skip-segment source you can pick in Settings, Playback, "Skip timestamps source," alongside the existing one. (Community contribution.)
 
 ## 0.3.8 Beta 11 - 2026-06-25 (pre-release)
 
