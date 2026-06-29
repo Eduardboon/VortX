@@ -286,6 +286,43 @@ export function cwResumeId(titleId: string): string | null {
   return continueWatching().find((e) => e.id === titleId)?.resumeId ?? null;
 }
 
+// Write-up trigger: fires after any local CW change so the account can push the active profile's web
+// watch-progress up to the bilateral doc.webProgress field (debounced in account.ts), making what you
+// watch on the web reach your apps and other browsers. No-op signed out.
+let cwSyncPusher: (() => void) | null = null;
+export function registerCwSyncPusher(fn: (() => void) | null): void {
+  cwSyncPusher = fn;
+}
+
+/** One bilateral web-progress entry, the shape both the app and other web clients read out of
+ *  doc.webProgress: id = display id, v = played id (episode), t/d = seconds, lastWatched = epoch ms. */
+export interface WebProgressEntry {
+  id: string;
+  type: string;
+  v: string;
+  t: number;
+  d: number;
+  lastWatched: number;
+  name?: string;
+  poster?: string;
+}
+
+/** The ACTIVE profile's local Continue Watching mapped into the bilateral webProgress entry shape. The
+ *  account pusher reads this for the current scope and writes it under doc.webProgress.owner (owner) or
+ *  .byProfile[profileId] (overlay). cwEntriesFrom on the read side consumes the same shape verbatim. */
+export function webProgressEntries(): WebProgressEntry[] {
+  return rawCW().map((e) => ({
+    id: e.id,
+    type: e.type,
+    v: e.resumeId,
+    t: e.position,
+    d: e.duration,
+    lastWatched: e.updatedAt,
+    name: e.name,
+    poster: e.poster,
+  }));
+}
+
 /** Record playback progress for `item` (its `resumeId` is the played id, defaulting to the display id);
  *  drops that played id once past 95% (finished). */
 export function recordProgress(
@@ -298,6 +335,7 @@ export function recordProgress(
   const others = rawCW().filter((e) => e.resumeId !== resumeId);
   if (position / duration > 0.95) {
     persistCW(others);
+    cwSyncPusher?.(); // finishing a title is a CW change too - push the dropped state up
     return;
   }
   const entry: CWEntry = {
@@ -311,11 +349,13 @@ export function recordProgress(
     updatedAt: Date.now(),
   };
   persistCW([entry, ...others].slice(0, 40));
+  cwSyncPusher?.(); // debounced account write-up of the active profile's web progress
 }
 
 /** Remove a title from Continue Watching (every played-id entry that shares this display id). */
 export function clearProgress(id: string): void {
   persistCW(rawCW().filter((e) => e.id !== id));
+  cwSyncPusher?.(); // propagate the removal up (apps/other browsers drop it on next pull)
 }
 
 function persistCW(entries: CWEntry[]): void {
