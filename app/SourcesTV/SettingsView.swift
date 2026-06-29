@@ -206,7 +206,7 @@ struct SettingsView: View {
                 .buttonStyle(ChipButtonStyle(selected: false))
                 .focused($accountFocus, equals: .importStremio)
                 NavigationLink { MetadataKeysView() } label: {
-                    Label("Metadata (TMDB, MDBList)", systemImage: "sparkles")
+                    Label("Metadata (TMDB, MDBList, fanart)", systemImage: "sparkles")
                 }
                 .buttonStyle(ChipButtonStyle(selected: false))
                 NavigationLink { DebridKeysView() } label: {
@@ -280,6 +280,10 @@ struct SettingsView: View {
                       selection: Binding(get: { autoSkip ? "1" : "0" }, set: { autoSkip = ($0 == "1") }))
             choiceRow(String(localized: "Skip timestamps source"), [("theintrodb", "TheIntroDB"), ("skipdb", "SkipDB"), ("both", "Both")],
                       selection: $skipProvider)
+            NavigationLink { SkipKeysView() } label: {
+                Label("Skip database key", systemImage: "checkmark.bubble")
+            }
+            .buttonStyle(ChipButtonStyle(selected: false))
             choiceRow(String(localized: "Play in"), externalPlayerChoices, selection: $defaultExternalPlayer)
             Text("Direct and debrid streams open in your chosen player automatically. Torrents and the built-in player are unaffected.")
                 .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)

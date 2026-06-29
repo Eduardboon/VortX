@@ -353,7 +353,7 @@ struct iOSSettingsView: View {
                 Button("Sign in to your Stremio account") { showSignIn = true }
             }
             NavigationLink("Import from Stremio") { StremioImportView() }
-            NavigationLink("Metadata (TMDB, MDBList)") { MetadataKeysView() }
+            NavigationLink("Metadata (TMDB, MDBList, fanart)") { MetadataKeysView() }
             NavigationLink("Debrid services") { DebridKeysView() }
             NavigationLink("Poster artwork (ERDB, ratings)") { XRDBSettingsView() }
         }
@@ -419,6 +419,7 @@ struct iOSSettingsView: View {
                 Text("SkipDB").tag("skipdb")
                 Text("Both").tag("both")
             }
+            NavigationLink("Skip database key") { SkipKeysView() }
             NavigationLink("Seek bar style") { SeekBarStylePicker() }
             Toggle("Community scrub previews", isOn: $communityTrickplay)
                 .tint(Theme.Palette.accent)
