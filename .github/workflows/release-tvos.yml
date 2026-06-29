@@ -44,13 +44,21 @@ jobs:
 
       - name: Select the newest Xcode on the runner
         run: |
-          # Pick the newest Xcode whose toolchain ACTUALLY EXISTS. A rotated runner image can ship a
-          # newest-by-version stub (e.g. Xcode_26.3.0.app) with no Contents/Developer, which made the
-          # Beta-14 build die with "missing DEVELOPER_DIR path". Walk newest-first and take the first
-          # install that has a real xcodebuild; fall back to the active xcode-select path if none match.
+          # Pick the newest Xcode whose toolchain ACTUALLY WORKS. A rotated runner image can ship a
+          # newest-by-version stub (e.g. Xcode_26.3.0.app) whose xcodebuild binary is present (passes a
+          # plain -x test) but whose Contents/Developer is missing/broken, so xcrun dies later with
+          # "missing DEVELOPER_DIR path" (the Beta-14 build failure). The -x file test is NOT enough:
+          # the same workflow passed on a runner with Xcode_26.6 and failed on one with the 26.3.0 stub.
+          # Walk newest-first and take the first install whose `xcodebuild -version` actually runs AND
+          # whose Contents/Developer directory really resolves; fall back to xcode-select if none match.
           XCODE=""
           for c in $(ls -d /Applications/Xcode_*.app 2>/dev/null | sort -Vr); do
-            if [ -x "$c/Contents/Developer/usr/bin/xcodebuild" ]; then XCODE="$c"; break; fi
+            dev="$c/Contents/Developer"
+            xb="$dev/usr/bin/xcodebuild"
+            if [ -d "$dev" ] && [ -x "$xb" ] && DEVELOPER_DIR="$dev" "$xb" -version >/dev/null 2>&1; then
+              XCODE="$c"; break
+            fi
+            echo "Skipping $c (no working toolchain at $dev)"
           done
           if [ -z "$XCODE" ]; then XCODE="$(dirname "$(dirname "$(xcode-select -p)")")"; fi
           echo "Selected Xcode: $XCODE ($("$XCODE/Contents/Developer/usr/bin/xcodebuild" -version 2>/dev/null | head -1))"
