@@ -13,6 +13,11 @@ A stability pass aimed straight at the Apple TV crash where the whole device han
 - **Apple TV no longer hangs the whole device after watching a torrent.** The streaming server keeps a memory cap that protects the Apple TV from running out of memory, but it was only set once at startup, with no confirmation it actually took. On a slow start it could silently miss, and the server then ran with a 2 GB cache that pushes the app past the Apple TV's memory limit, so the system kills it and the whole device goes sluggish (the menu bar stops responding, Back drops you to Home, and reopening shows the server offline). The cap is now confirmed and retried until it sticks, and it is re-applied right before each torrent starts, so every stream runs inside the safe limit.
 - **A finished movie leaves Continue Watching on every profile.** A movie watched to the end could stay pinned in Continue Watching, most often on a second profile. It clears now.
 - **Smoother second profile.** Watch progress was nudging the cross-device sync on every tick while you watched; it now waits until you pause or stop, which keeps a second profile from feeling laggy.
+- **Apple TV: a movie's page opens on Watch Now again, not the Trailer button.** When you opened a movie while its sources were still loading, the focus landed on the Trailer chip instead of Watch Now. The page now seats focus on Watch Now from the moment it appears and keeps it there as the sources settle.
+
+### Added
+
+- **Upcoming Episodes on Home.** A new rail shows the next episode of the shows in your library that air within the next 45 days, soonest first, on Apple TV, iPhone, iPad, and Mac. It uses the same air-date data the new-episode reminders already gather, routes to the show when you open a card, and simply does not appear when nothing is upcoming.
 
 ## 0.3.8 Beta 13 - 2026-06-28 (pre-release)
 
