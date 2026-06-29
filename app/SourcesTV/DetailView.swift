@@ -938,12 +938,23 @@ struct CoreStreamList: View {
     // Debrid cache AWARENESS: which raw torrents the user's debrid account has cached, so they badge +
     // rank up. Empty (no badges, ranking unchanged) with no debrid key configured.
     @StateObject private var debridCache = DebridCacheAwareness()
+    // Offline-download state (#30, tvOS): the device-local index drives the Download chip's three
+    // affordances (Download / Downloading / Downloaded) the same way iOS does. Device-local only; nothing
+    // here syncs or touches the account library.
+    @ObservedObject private var downloads = DownloadStore.shared
+    /// Once the user has confirmed (and dismissed) the storage-eviction warning the first time, never show
+    /// it again. Per device (a plain @AppStorage bool), not synced.
+    @AppStorage("stremiox.downloadEvictionAck") private var downloadEvictionAck = false
+    /// Drives the first-download confirmation dialog; carries the resolve closure to run on confirm.
+    @State private var pendingDownload: (() -> Void)?
 
     /// Pin context derived from the title being shown - a movie pin or a show pin, both keyed by the
     /// library (meta) id. A series episode list passes a `type: "series"` PlaybackMeta, so every episode
     /// shares the one show pin.
     private var pinContext: SourcePinContext? { meta.map { SourcePinContext(metaId: $0.libraryId, isSeries: $0.type == "series") } }
     private var sourcePin: ResolvedPin? { pinContext.flatMap { pinStore.effectivePin($0) } }
+    /// A live channel has no fixed file to save, so the offline Download chip is hidden for it.
+    private var isLive: Bool { meta.map { LiveTypes.contains($0.type) } ?? false }
 
     var body: some View {
         let groups = StreamRanking.rankedGroups(displayGroups(core.streamGroups()), pin: sourcePin,
@@ -1024,6 +1035,14 @@ struct CoreStreamList: View {
                     }
                     .buttonStyle(ChipButtonStyle(selected: showAllSources))
 
+                    // Offline download of the auto-picked best source (#30). Same three-state feedback as
+                    // iOS: Download (idle, only when watchReady) / Downloading / Downloaded. Disabled while
+                    // sources still settle so it can't queue a half-ranked pick. Hidden for LIVE channels,
+                    // which have no fixed file to save.
+                    if !isLive {
+                        downloadChip(ready: watchReady) { requestDownload { Task { await downloadBest(best) } } }
+                    }
+
                     LibraryChip()
                 }
                 // #16: why the recommended source was auto-picked - the rank decision the per-row tags don't show.
@@ -1094,6 +1113,87 @@ struct CoreStreamList: View {
         .onChange(of: core.streamLoadProgress().loaded) { _ in
             debridCache.refresh(from: displayGroups(core.streamGroups()))
         }
+        // First-download storage-eviction warning (#30). Apple TV has no user-visible file system and the
+        // OS can reclaim app storage under pressure, so a saved download may be removed by the system. Show
+        // this once; on confirm we remember the ack and run the queued download, on cancel we drop it.
+        .confirmationDialog("Save this download to Apple TV?",
+                            isPresented: Binding(get: { pendingDownload != nil },
+                                                 set: { if !$0 { pendingDownload = nil } }),
+                            titleVisibility: .visible) {
+            Button("Download") {
+                downloadEvictionAck = true
+                let run = pendingDownload
+                pendingDownload = nil
+                run?()
+            }
+            Button("Cancel", role: .cancel) { pendingDownload = nil }
+        } message: {
+            Text("tvOS can reclaim app storage when the device runs low, so a saved download may be removed by the system. Re-download it any time it is gone.")
+        }
+    }
+
+    // MARK: Offline download (#30)
+
+    /// The offline-download state for this list's video id, derived from `DownloadStore`. Mirrors iOS's
+    /// `downloadChipState`: no record -> offer a download, an active record -> "Downloading", a completed
+    /// record -> "Downloaded". Returns `.none` when there is no `meta` (e.g. a bare Search call site).
+    private enum DownloadChipState { case none, inProgress, done }
+
+    private func downloadChipState() -> DownloadChipState {
+        guard let videoId = meta?.videoId,
+              let record = downloads.records.first(where: { $0.videoId == videoId && $0.state != .failed }) else { return .none }
+        return record.state == .completed ? .done : .inProgress
+    }
+
+    /// A focus-driven Download chip with state feedback (#30), the tvOS twin of the iOS `downloadChip`. The
+    /// idle state offers a download (enabled only when `ready`); while a record is active it shows a spinner
+    /// + "Downloading" and is disabled; once complete it shows a "Downloaded" check and is disabled. The
+    /// action runs only from the idle state, so a press can't re-queue an in-flight or finished download.
+    @ViewBuilder private func downloadChip(ready: Bool, action: @escaping () -> Void) -> some View {
+        let state = downloadChipState()
+        Button {
+            if state == .none { action() }
+        } label: {
+            switch state {
+            case .done:
+                Label("Downloaded", systemImage: "checkmark.circle.fill")
+            case .inProgress:
+                HStack(spacing: Theme.Space.sm) {
+                    ProgressView()
+                    Text("Downloading")
+                }
+            case .none:
+                Label("Download", systemImage: "arrow.down.circle")
+            }
+        }
+        .buttonStyle(ChipButtonStyle())
+        .disabled(state != .none || !ready)
+    }
+
+    /// Gate a download behind the one-time eviction warning. The first time, stash the resolve closure and
+    /// open the confirmation dialog (which runs it on confirm); after the user has acknowledged it once,
+    /// run immediately.
+    private func requestDownload(_ run: @escaping () -> Void) {
+        if downloadEvictionAck { run() } else { pendingDownload = run }
+    }
+
+    /// "Download best": the offline twin of Watch Now, downloading the already-ranked best source. Resolves
+    /// the URL EXACTLY as `playResolving` does (cached-debrid direct link preferred, else the source's
+    /// `playableURL`) and hands the SAME `PlaybackMeta` this list carries to `DownloadManager`. Device-local
+    /// only; writes nothing to the account / libraryItem docs. No-op without a `meta` or a playable URL.
+    @MainActor private func downloadBest(_ best: CoreStream) async {
+        guard let pm = meta else { return }
+        let resolved = await DebridCoordinator.shared.resolvedPlaybackURL(for: best, episode: downloadEpisode(pm))
+        guard let url = resolved ?? best.playableURL else { return }
+        DownloadManager.shared.download(stream: best, meta: pm, resolvedURL: url,
+                                        sourceName: best.name, qualityText: StreamRanking.signature(best))
+    }
+
+    /// The episode context for a debrid resolve, so a series episode resolves to the right file inside a
+    /// season pack (matching `iOSDetailView.downloadBestSeries`). Nil for a movie / live.
+    private func downloadEpisode(_ pm: PlaybackMeta) -> DebridEpisode? {
+        guard pm.type == "series", let s = pm.season, let e = pm.episode else { return nil }
+        return DebridEpisode(season: s, episode: e)
     }
 
     /// Resolution dropdown for the Watch button (long-press): the best source at each available quality.
