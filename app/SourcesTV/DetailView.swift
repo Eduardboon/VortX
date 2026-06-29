@@ -409,10 +409,13 @@ struct DetailView: View {
         // the hero region fills a tall top band proportioned like the movie page hero. The episode list
         // (CoreSeasonedEpisodes) still renders BELOW it in the seriesPage scroll, unchanged.
         ZStack(alignment: .bottomLeading) {
-            // For a SERIES the engine often has no landscape `background` and falls back to the portrait
-            // poster, which .fill would crop in this wide hero band (the "cut off hero"). Series render the
-            // backdrop with .fit (no crop); movies keep .fill since they carry a 16:9 background.
-            FullBleedBackdrop(url: m.background ?? m.poster, contentMode: m.type == "series" ? .fit : .fill)
+            // Use the cinematic edge-to-edge .fill whenever a real 16:9 `background` exists (the common case,
+            // e.g. Family Guy) so the hero is FULL-BLEED and never pillarboxed. Only a series that falls back
+            // to its PORTRAIT poster (no landscape background) uses .fit, to avoid cropping the tall art.
+            // (FIX J follow-up: blanket .fit on a real 16:9 backdrop pillarboxed the band - the "season hero
+            // looks worse" report. Branch on whether we actually have a landscape background, not on type.)
+            FullBleedBackdrop(url: m.background ?? m.poster,
+                              contentMode: (m.type == "series" && m.background == nil) ? .fit : .fill)
             // #44: the muted, looping trailer fades in OVER the still hero art, full-bleed behind the title.
             // Non-focusable + no hit-testing, so the focusable Play / Episodes row below is untouched.
             heroTrailerLayer(m).ignoresSafeArea()
