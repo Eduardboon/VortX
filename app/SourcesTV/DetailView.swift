@@ -42,6 +42,14 @@ struct DetailView: View {
                 } else {
                     moviePage(meta)
                 }
+            } else if !LiveTypes.contains(type), type != "series", id.hasPrefix("tt"),
+                      let placeholder = CoreMetaItem.placeholder(id: id, type: type, name: "") {
+                // Cinemeta meta is nil for this tt (a new/unreleased title: tt at TMDB, not yet in Cinemeta).
+                // The page is meta-driven, so without this it sat on a spinner forever AND the streams guard
+                // never passed -> "No sources found". Render moviePage from a metahub-by-tt placeholder so the
+                // hero paints and the sources list shows; the relaxed streams guard fires on the tt directly.
+                // When the real meta later arrives, onChange swaps to it.
+                moviePage(placeholder)
             } else {
                 // Focusable so Back pops this view instead of exiting the app while it loads.
                 ScrollView {
@@ -67,6 +75,10 @@ struct DetailView: View {
                 loadMovieStreamsIfNeeded()
             } else {
                 core.loadMeta(type: type, id: id)
+                // An imdb tt whose Cinemeta meta may never arrive (new/unreleased) would never reach the
+                // onChange(meta?.id) that dispatches streams: fire the tt-keyed streams now so the sources
+                // list populates regardless of the meta race. No-op'd by hasStreams once they land.
+                loadMovieStreamsIfNeeded()
             }
             captureHero()
             if let m = core.metaDetails?.meta, m.id == id { loadSimilar(m); loadRatings(); loadWatchProviders(); loadFinancials(); loadReleaseDates() }
@@ -132,7 +144,15 @@ struct DetailView: View {
     /// resident. No-op for series and until this title's meta loaded. The hasStreams guard keys on the
     /// EFFECTIVE id so no re-dispatch loop forms once the imdb-keyed streams arrive.
     private func loadMovieStreamsIfNeeded() {
-        guard type != "series", core.metaDetails?.meta?.id == id else { return }
+        guard type != "series" else { return }
+        // Relaxed guard (build 137): the old `meta?.id == id` gate blocked streams whenever Cinemeta meta
+        // was nil (a new/unreleased tt not yet in Cinemeta -> "No sources found"). Fire either when this
+        // title's meta is resident (the imdb-defaultVideoId path) OR, with meta still absent, directly on
+        // the catalog id when it is itself an imdb tt (the hub-card case). Non-imdb ids without meta still
+        // wait (their stream id only resolves from the meta). hasStreams keys on the effective id, so no
+        // re-dispatch loop forms once the streams arrive.
+        let metaResident = core.metaDetails?.meta?.id == id
+        guard metaResident || id.hasPrefix("tt") else { return }
         let streamId = movieStreamId
         let hasStreams = core.metaDetails?.streams.contains { $0.request.path.id == streamId } ?? false
         guard !hasStreams else { return }
@@ -228,20 +248,34 @@ struct DetailView: View {
             : profiles.watchedVideoIds(forMeta: meta.id)
         let primary = seriesPrimaryEpisode(videos, watched: watched, metaID: meta.id)
         let primaryProgress = primary.map { episodeProgress($0.video, metaID: meta.id) } ?? 0
+        // FIX (build 137): the series/season hero was chopped at the top + not full-bleed because the
+        // backdrop lived INSIDE hero(), i.e. inside the VStack inside the ScrollView, so its
+        // .ignoresSafeArea() could not escape the top nav-bar safe-area inset. Hoist FullBleedBackdrop +
+        // heroTrailerLayer to a page-root ZStack sibling (matching moviePage/livePage/CoreEpisodeStreams),
+        // so they sit at the screen edge and bleed under the nav bar + to the bottom overscan. hero() then
+        // drops its own (now duplicated) backdrop + trailer layer (see hero()).
         return ScrollViewReader { proxy in
-            ScrollView {
-                VStack(alignment: .leading, spacing: Theme.Space.xl) {
-                    hero(meta, primaryEpisode: primary?.video, primaryIsResume: primary?.isResume == true,
-                         primaryProgress: primaryProgress,
-                         scrollToContent: { withAnimation { proxy.scrollTo("detailContent", anchor: .top) } })
-                    CoreSeasonedEpisodes(meta: meta, videos: videos,
-                                         watched: watched,
-                                         initialSeason: primary?.video.season)
-                        .id("detailContent")
-                    whereToWatchSection
-                    moreLikeThisSection
+            ZStack {
+                // Carry the .fit/.fill branch EXACTLY: .fill when a real landscape background exists (the
+                // common case, full-bleed, never pillarboxed); .fit only when a series falls back to its
+                // portrait poster (no landscape background), to avoid cropping the tall art.
+                FullBleedBackdrop(url: meta.background ?? meta.poster,
+                                  contentMode: (meta.type == "series" && meta.background == nil) ? .fit : .fill)
+                heroTrailerLayer(meta).ignoresSafeArea()
+                ScrollView {
+                    VStack(alignment: .leading, spacing: Theme.Space.xl) {
+                        hero(meta, primaryEpisode: primary?.video, primaryIsResume: primary?.isResume == true,
+                             primaryProgress: primaryProgress,
+                             scrollToContent: { withAnimation { proxy.scrollTo("detailContent", anchor: .top) } })
+                        CoreSeasonedEpisodes(meta: meta, videos: videos,
+                                             watched: watched,
+                                             initialSeason: primary?.video.season)
+                            .id("detailContent")
+                        whereToWatchSection
+                        moreLikeThisSection
+                    }
+                    .padding(.bottom, Theme.Space.xl)
                 }
-                .padding(.bottom, Theme.Space.xl)
             }
         }
     }
@@ -418,28 +452,12 @@ struct DetailView: View {
     private func hero(_ m: CoreMetaItem, primaryEpisode: CoreVideo? = nil, primaryIsResume: Bool = false,
                       primaryProgress: Double = 0,
                       scrollToContent: @escaping () -> Void) -> some View {
-        // FIX J: the series hero is now FULL-BLEED, matching the movie detail + home hero, instead of the
-        // old fixed ~560pt clipped band that read as a small box. The backdrop uses the shared
-        // FullBleedBackdrop treatment (self-bleeding past safe area horizontally, warm canvas scrims), and
-        // the hero region fills a tall top band proportioned like the movie page hero. The episode list
-        // (CoreSeasonedEpisodes) still renders BELOW it in the seriesPage scroll, unchanged.
-        ZStack(alignment: .bottomLeading) {
-            // Use the cinematic edge-to-edge .fill whenever a real 16:9 `background` exists (the common case,
-            // e.g. Family Guy) so the hero is FULL-BLEED and never pillarboxed. Only a series that falls back
-            // to its PORTRAIT poster (no landscape background) uses .fit, to avoid cropping the tall art.
-            // (FIX J follow-up: blanket .fit on a real 16:9 backdrop pillarboxed the band - the "season hero
-            // looks worse" report. Branch on whether we actually have a landscape background, not on type.)
-            FullBleedBackdrop(url: m.background ?? m.poster,
-                              contentMode: (m.type == "series" && m.background == nil) ? .fit : .fill)
-            // #44: the muted, looping trailer fades in OVER the still hero art, full-bleed behind the title.
-            // Non-focusable + no hit-testing, so the focusable Play / Episodes row below is untouched.
-            heroTrailerLayer(m).ignoresSafeArea()
-            // A bottom canvas scrim under the title/actions block so it stays readable over vivid art.
-            LinearGradient(colors: [.clear, Theme.Palette.canvas.opacity(0.55), Theme.Palette.canvas],
-                           startPoint: .top, endPoint: .bottom)
-                .ignoresSafeArea()
-                .allowsHitTesting(false)
-
+        // FIX (build 137): the backdrop + trailer layer are now hoisted to the seriesPage page-root ZStack
+        // (so they bleed under the nav bar at the top + to the bottom overscan, like moviePage). hero() is
+        // now a plain in-flow VStack: a leading Spacer pushes the title/actions block onto the lower band
+        // where the FullBleedBackdrop's own bottom scrim keeps it readable. Mirrors moviePage exactly.
+        VStack(alignment: .leading, spacing: Theme.Space.sm) {
+            Spacer().frame(height: 380)
             VStack(alignment: .leading, spacing: Theme.Space.sm) {
                 Text(m.name)
                     .font(Theme.Typography.hero).tracking(-1.5)
@@ -501,10 +519,10 @@ struct DetailView: View {
             .padding(.horizontal, Theme.Space.screenEdge)
             .padding(.bottom, Theme.Space.lg)
         }
-        // FIX J: a tall, full-width hero region so the backdrop fills the top of the screen like the movie
-        // detail + home hero, instead of the old small ~560pt band. The title/actions block stays pinned to
-        // the bottom (ZStack .bottomLeading); the episode list scrolls in below this in seriesPage.
-        .frame(maxWidth: .infinity, minHeight: 760, alignment: .bottomLeading)
+        // In-flow hero: the leading Spacer(380) reserves the top band for the hoisted full-bleed backdrop,
+        // and the title/actions block sits on the lower scrimmed band. Greedy on width + leading aligned,
+        // matching moviePage; no fixed minHeight (the backdrop now fills the page-root ZStack, not this view).
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 
     /// #44 in-hero trailer layer: a muted, looping libmpv clip ({serverBase}/yt/{id}) painted OVER the

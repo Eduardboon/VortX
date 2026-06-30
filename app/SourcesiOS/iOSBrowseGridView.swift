@@ -11,17 +11,11 @@ import SwiftUI
 
 struct iOSCollectionsHub: View {
     @ObservedObject var model: CollectionsHubModel
-    @ObservedObject private var downloads = DownloadStore.shared   // surface a Downloads tile only when there are any
 
     var body: some View {
         VStack(alignment: .leading, spacing: Theme.Space.lg) {
-            // Downloads tile: shown ONLY when there is at least one download, so Home stays clean by default.
-            // A second entry point alongside the inline Library downloads section (no new bottom-bar tab).
-            if !downloads.records.isEmpty {
-                hubSection(title: "Downloads") {
-                    NavigationLink { iOSDownloadsScreen() } label: { iOSDownloadsTile(count: downloads.records.count) }.buttonStyle(.plain)
-                }
-            }
+            // Downloads is reachable ONLY via the Downloads pill inside the Library tab (owner's final
+            // directive). No Downloads tile on Home/Discover, no inline mount at the top of Library.
             hubSection(title: "Discover") {
                 ForEach(model.discover, id: \.self) { list in
                     NavigationLink(value: HubTarget.discover(list)) { iOSDiscoverCard(list: list, backdrop: model.discoverBackdrops[list]) }.buttonStyle(.plain)
@@ -55,9 +49,15 @@ struct iOSCollectionsHub: View {
 
 // MARK: - Tiles
 
-// One pill size everywhere: the streaming + genre tiles match the Discover card (the owner's reference size),
-// instead of the old half-width tiles that read as tiny icons.
-private let kiOSCardWidth: CGFloat = 224
+// One pill WIDTH everywhere (the owner's "every pill should be the same size"): the streaming + genre +
+// Discover hub tiles AND the movie/show/Continue-Watching poster cards all derive their column width from
+// this single value, so no tile is wider or narrower than another. Lives on a shared enum so PosterCardiOS
+// (in iOSRootView) can reference the exact same number.
+enum iOSPillMetrics {
+    /// The shared tile/pill column width used across the hub tiles and the poster cards.
+    static let cardWidth: CGFloat = 224
+}
+private let kiOSCardWidth: CGFloat = iOSPillMetrics.cardWidth
 
 struct iOSDiscoverCard: View {
     let list: DiscoverList
@@ -106,28 +106,6 @@ struct iOSServiceTile: View {
                 Text(provider.name).font(.system(size: 18, weight: .bold)).foregroundStyle(Theme.Palette.textPrimary)
                     .multilineTextAlignment(.center).padding(10)
             }
-        }
-        .frame(width: kiOSCardWidth, height: kiOSCardWidth * 0.5)
-        .clipShape(RoundedRectangle(cornerRadius: Theme.Radius.card, style: .continuous))
-    }
-}
-
-/// The Downloads hub tile: a gradient card with the offline glyph and a count, matching the Discover-card
-/// size. Pushes the standalone `iOSDownloadsScreen`.
-struct iOSDownloadsTile: View {
-    let count: Int
-    var body: some View {
-        ZStack(alignment: .bottomLeading) {
-            LinearGradient(colors: [Theme.Palette.surface2, Theme.Palette.surface1], startPoint: .topLeading, endPoint: .bottomTrailing)
-            Image(systemName: "arrow.down.circle.fill")
-                .font(.system(size: 22, weight: .bold)).foregroundStyle(Theme.Palette.accent)
-                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topTrailing).padding(Theme.Space.md)
-            VStack(alignment: .leading, spacing: 2) {
-                Text("Downloads").font(.system(size: 17, weight: .bold)).foregroundStyle(.white)
-                Text(count == 1 ? "1 item saved offline" : "\(count) items saved offline")
-                    .font(.system(size: 11, weight: .medium)).foregroundStyle(.white.opacity(0.85)).lineLimit(2)
-            }
-            .padding(Theme.Space.md)
         }
         .frame(width: kiOSCardWidth, height: kiOSCardWidth * 0.5)
         .clipShape(RoundedRectangle(cornerRadius: Theme.Radius.card, style: .continuous))
@@ -200,10 +178,13 @@ struct iOSCategoryBrowse: View {
             .padding(.bottom, Theme.Space.md)
         }
         .background(Theme.Palette.canvas.ignoresSafeArea())
-        .navigationTitle(target.title)
+        // navigationTitle on a pushed view bridges into the shared window NSToolbar on macOS and crashes
+        // (_insertNewItemWithItemIdentifier). iOS-only; on macOS the title shows in-content.
         #if os(iOS)
+        .navigationTitle(target.title)
         .navigationBarTitleDisplayMode(.inline)
         #endif
+        .macBackAffordance()   // macOS in-content Back + Esc / Cmd-[ (no toolbar back exists)
         .onAppear { pushing = false; if selectedID.isEmpty, let first = subs.first { select(first.id) } }
         .onDisappear { loadTask?.cancel() }
     }
@@ -294,11 +275,13 @@ struct iOSReorderServicesView: View {
         }
         .scrollContentBackground(.hidden)
         .background(Theme.Palette.canvas.ignoresSafeArea())
-        .navigationTitle("Reorder Services")
+        // iOS-only: a macOS navigationTitle on this pushed reorder list crashes the shared NSToolbar.
         #if os(iOS)
+        .navigationTitle("Reorder Services")
         .navigationBarTitleDisplayMode(.inline)
         .environment(\.editMode, .constant(.active))
         #endif
+        .macBackAffordance()   // macOS in-content Back + Esc / Cmd-[ (no toolbar back exists)
         .onAppear { model.load() }
     }
 

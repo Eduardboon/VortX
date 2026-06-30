@@ -295,6 +295,33 @@ struct CoreMetaItem: Decodable {
         // filter matched nothing, so detail + episode headers always showed empty genres. Accept both.
         (links ?? []).filter { ["genre", "genres"].contains($0.category.lowercased()) }.map(\.name)
     }
+
+    /// A PROVISIONAL playback duration in seconds parsed from the human `runtime` string ("60 min",
+    /// "1h 32m", "92 min", "2:05:00"). Used by community trickplay to key + start capture at the first
+    /// positive timePos, BEFORE mpv emits its `duration` event (which a debrid MKV may never deliver). The
+    /// real mpv duration later refines the bucket. Returns nil when no number can be read.
+    var runtimeSeconds: Double? {
+        guard let r = runtime?.lowercased() else { return nil }
+        // "h:mm:ss" or "mm:ss" colon form first.
+        if r.contains(":") {
+            let parts = r.split(separator: ":").compactMap { Int($0.trimmingCharacters(in: .whitespaces)) }
+            if parts.count == 3 { return Double(parts[0] * 3600 + parts[1] * 60 + parts[2]) }
+            if parts.count == 2 { return Double(parts[0] * 60 + parts[1]) }
+        }
+        // "1h 32m" / "1 h 32 min" form: sum hours + minutes when an explicit hour marker is present.
+        var totalMinutes = 0
+        var matched = false
+        let scanner = Scanner(string: r)
+        scanner.charactersToBeSkipped = CharacterSet.alphanumerics.inverted
+        while !scanner.isAtEnd {
+            guard let n = scanner.scanInt() else { break }
+            let unit = scanner.scanCharacters(from: CharacterSet.lowercaseLetters) ?? ""
+            if unit.hasPrefix("h") { totalMinutes += n * 60; matched = true }
+            else { totalMinutes += n; matched = true }   // bare number or "min" -> minutes
+        }
+        guard matched, totalMinutes > 0 else { return nil }
+        return Double(totalMinutes * 60)
+    }
     var imdbRating: String? {
         (links ?? []).first { $0.category.caseInsensitiveCompare("imdb") == .orderedSame }?.name
     }
@@ -350,6 +377,23 @@ struct CoreMetaItem: Decodable {
             return trimmed
         }
         return nil
+    }
+
+    /// A minimal placeholder meta for a title whose Cinemeta meta is nil (a brand-new/unreleased title:
+    /// the `tt` exists at TMDB but is not yet in Cinemeta). The detail page is driven entirely by this
+    /// meta, so meta=nil used to leave an empty hero AND blocked the sources list. This synthesizes just
+    /// enough (id, type, name, and Stremio's standard metahub-by-tt backdrop/logo) so the hero paints and
+    /// the stream request can still fire on the `tt`. Built via JSON decode so it tracks the struct's own
+    /// field set with no manual memberwise init. Returns nil only if the decoder itself fails (never, here).
+    static func placeholder(id: String, type: String, name: String) -> CoreMetaItem? {
+        let bg = id.hasPrefix("tt") ? "https://images.metahub.space/background/big/\(id)/img" : ""
+        let logo = id.hasPrefix("tt") ? "https://images.metahub.space/logo/medium/\(id)/img" : ""
+        let json: [String: Any] = [
+            "id": id, "type": type, "name": name,
+            "background": bg, "logo": logo,
+        ]
+        guard let data = try? JSONSerialization.data(withJSONObject: json) else { return nil }
+        return try? JSONDecoder().decode(CoreMetaItem.self, from: data)
     }
 }
 

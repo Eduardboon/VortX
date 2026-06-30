@@ -157,6 +157,13 @@ struct iOSDetailView: View {
     let id: String
     let type: String
     let title: String
+    /// Seed art carried from the hub card that pushed this detail, so the hero never blanks while
+    /// (or if) Cinemeta meta is nil. A brand-new/unreleased title (`tt` at TMDB but not yet in Cinemeta)
+    /// loads with meta=nil, which used to leave the hero empty; threading the card's already-resolved
+    /// backdrop/logo (catalog background, else metahub-by-tt, else poster) keeps it populated. Defaults
+    /// to nil so the existing non-hub call sites (search / live / similar) keep compiling unchanged.
+    var seedBackdrop: String? = nil
+    var seedLogo: String? = nil
     @EnvironmentObject private var core: CoreBridge
     @EnvironmentObject private var account: StremioAccount
     @EnvironmentObject private var theme: ThemeManager   // observe textScale so Theme.Typography repaints live
@@ -307,8 +314,15 @@ struct iOSDetailView: View {
             }
         }
         .background(Theme.Palette.canvas.ignoresSafeArea())
+        // navigationTitle on a PUSHED view bridges into the single shared window NSToolbar on macOS and
+        // crashes in _insertNewItemWithItemIdentifier (the Beta 7 Mac crash). iOS-only; on macOS the title
+        // already reads from the in-content hero.
+        #if os(iOS)
         .navigationTitle(meta?.name ?? title)
         .inlineNavigationTitle()
+        #endif
+        // macOS has no toolbar back button (toolbar removed), so supply an in-content Back + Esc / Cmd-[.
+        .macBackAffordance()
         // Guard the meta load: the shared CoreBridge already holds this title's meta on an A -> back -> A
         // revisit, so re-loading it churns the engine and momentarily blanks the hero for no reason.
         .onAppear {
@@ -319,6 +333,10 @@ struct iOSDetailView: View {
                 loadMovieStreamsIfNeeded()        // meta already resident → dispatch streams now
             } else {
                 core.loadMeta(type: type, id: id) // load meta FIRST; onChange dispatches streams on arrival
+                // For an imdb tt id whose Cinemeta meta may never arrive (new/unreleased title), don't wait
+                // on the onChange(meta?.id) that would never fire: fire the tt-keyed streams now so the
+                // sources list populates regardless of the meta race. No-op'd by hasStreams once they land.
+                loadMovieStreamsIfNeeded()
             }
             if let m = core.metaDetails?.meta, m.id == id { loadSimilar(m); loadRatings(); loadWatchProviders(); loadFinancials(); loadReleaseDates(); resolveTrailerIfNeeded(m) }
         }
@@ -513,7 +531,14 @@ struct iOSDetailView: View {
     /// Full-bleed artwork with the same two scrims tvOS uses: a vertical canvas fade so the lower text
     /// block stays readable, and a leading canvas fade for the title column.
     private var backdrop: some View {
-        AsyncImage(url: URL(string: meta?.background ?? meta?.poster ?? "")) { phase in
+        // Fall back through: meta background -> meta poster -> the hub card's seed backdrop ->
+        // metahub-by-tt (so a meta=nil unreleased title still paints art) -> the seed logo's poster.
+        // Without this the hero blanked to surface1 whenever Cinemeta meta was nil (Cocktail 2,
+        // Evil Dead Burn: tt exists at TMDB, not yet in Cinemeta).
+        let bg = meta?.background ?? meta?.poster
+            ?? seedBackdrop
+            ?? FeaturedHeroItem.metahubBackground(forId: id)
+        return AsyncImage(url: URL(string: bg ?? "")) { phase in
             switch phase {
             // Movies carry a 16:9 `background`, so .fill crops cleanly. A SERIES usually has no landscape
             // background and falls back to the PORTRAIT `poster`; .fill on that in the landscape band crops
@@ -613,8 +638,11 @@ struct iOSDetailView: View {
     /// otherwise the serif hero type.
     @ViewBuilder private var titleOrLogo: some View {
         // fanart.tv clearlogo first (when enabled), else the ERDB-aware add-on/metahub logo, else serif text.
-        ResolvedTitleLogo(id: meta?.behaviorHints?.defaultVideoId ?? meta?.id, type: meta?.type ?? "movie", fallbackLogo: meta?.logo,
-                          maxWidth: 320, maxHeight: 110, accessibilityName: meta?.name ?? "") {
+        // When meta is nil (unreleased/new title not yet in Cinemeta) fall through to the detail id and the
+        // hub card's seed logo (metahub-by-tt), so the hero shows the show LOGO instead of blanking.
+        ResolvedTitleLogo(id: meta?.behaviorHints?.defaultVideoId ?? meta?.id ?? id, type: meta?.type ?? type,
+                          fallbackLogo: meta?.logo ?? seedLogo ?? FeaturedHeroItem.metahubLogo(forId: id),
+                          maxWidth: 320, maxHeight: 110, accessibilityName: meta?.name ?? title) {
             heroTitle
         }
     }
@@ -978,7 +1006,16 @@ struct iOSDetailView: View {
     /// the imdb defaultVideoId). The hasStreams guard keys on the EFFECTIVE id, so a re-dispatch loop can't
     /// form once the imdb-keyed streams arrive.
     private func loadMovieStreamsIfNeeded() {
-        guard type != "series", core.metaDetails?.meta?.id == id else { return }
+        guard type != "series" else { return }
+        // Relaxed guard (build 137): the old `meta?.id == id` gate blocked streams whenever Cinemeta meta
+        // was nil (a brand-new/unreleased title: tt at TMDB, not yet in Cinemeta -> "No sources found"
+        // even though imdb-keyed add-ons would answer the tt). Fire streams either when this title's meta
+        // is resident (the normal imdb-defaultVideoId path) OR, when meta is still absent, directly on the
+        // catalog id IF it is itself an imdb tt id (the hub-card case). Non-imdb ids without meta still wait
+        // (their stream id only resolves from the meta's defaultVideoId). The hasStreams guard keys on the
+        // effective id, so this can't form a re-dispatch loop once the streams arrive.
+        let metaResident = core.metaDetails?.meta?.id == id
+        guard metaResident || id.hasPrefix("tt") else { return }
         let streamId = movieStreamId
         let hasStreams = core.metaDetails?.streams.contains { $0.request.path.id == streamId } ?? false
         guard !hasStreams else { return }
@@ -1728,8 +1765,12 @@ struct iOSEpisodeStreams: View {
         }
         }
         .background(Theme.Palette.canvas.ignoresSafeArea())
+        // iOS-only: a macOS navigationTitle on this pushed episode-streams view crashes the shared NSToolbar.
+        #if os(iOS)
         .navigationTitle(video.episodeTitle)
         .inlineNavigationTitle()
+        #endif
+        .macBackAffordance()   // macOS in-content Back + Esc / Cmd-[ (no toolbar back exists)
         // The engine loads per-episode streams on demand; trigger that load for THIS episode — but only
         // when the resident streams aren't already this episode's, so a back/forward revisit doesn't churn.
         .onAppear {

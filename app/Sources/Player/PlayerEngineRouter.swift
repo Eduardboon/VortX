@@ -89,6 +89,15 @@ enum PlayerEngineRouter {
     /// container AVPlayer handles natively. Used by rule (3) so the DV flip only fires when it can succeed.
     static func isAVPlayerContainer(_ url: URL) -> Bool {
         let ext = url.pathExtension.lowercased()
-        return ext == "mp4" || ext == "m4v" || ext == "mov" || isHLS(url)
+        if ext == "mp4" || ext == "m4v" || ext == "mov" || isHLS(url) { return true }
+        // Debrid/CDN links carry the filename in a query param or an extensionless /download/<id> path
+        // (e.g. TorBox "...?file=Movie.DV.mp4"), so pathExtension is empty and a genuinely-playable DV mp4
+        // wrongly went to libmpv. Only widen when the path has NO usable extension, so a real .mkv path
+        // still returns false and stays on libmpv.
+        if ext.isEmpty {
+            let s = url.absoluteString.lowercased()
+            if s.contains(".mp4") || s.contains(".m4v") || s.contains(".mov") { return true }
+        }
+        return false
     }
 }

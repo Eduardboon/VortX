@@ -456,6 +456,7 @@ struct PlayerScreen: View {
             #endif
             curURL = url; curHeaders = headers; curIsTorrent = recordIsTorrent
             scrubThumbnails.configure(localCacheKey: trickplayLocalCacheKey)
+            configureCommunityTrickplayProvisional()
             scheduleHide(); startLoadTimeout()
             #if os(iOS)
             UIApplication.shared.isIdleTimerDisabled = true   // hold the screen awake while the player is open (parity with tvOS)
@@ -589,6 +590,9 @@ struct PlayerScreen: View {
                     #endif
                     updateCurrentSkip(at: d)
                     NowPlayingCenter.update(title: curTitle, elapsed: d, duration: duration, paused: isPaused)
+                    // Provision the community key off meta.runtime the moment the behind-playback meta lands
+                    // (idempotent; no-op once keyed), so capture starts even without a duration event.
+                    configureCommunityTrickplayProvisional()
                     maybeCaptureLocalTrickplay(at: d)
                     // Live streams must NOT write a resume offset: their "position" is just elapsed
                     // wall-clock of the buffer, and persisting it would make a later open seek into a
@@ -630,10 +634,12 @@ struct PlayerScreen: View {
                     }
                 }
                 refreshSkipSegments()
-                // Community trickplay: once the duration is known, fetch any shared sprite-sheet for this
-                // exact cut (fail-soft -> the existing local capture). Acts once per title.
+                // Community trickplay: re-key on the REAL playback duration (authoritative bucket) and
+                // unblock uploads. Capture already started from the provisional meta.runtime key, so a
+                // debrid MKV that never delivers this event still captures + can upload.
                 if d > 0, let m = curMeta {
-                    scrubThumbnails.configureCommunity(imdbId: m.libraryId, season: m.season, episode: m.episode, duration: d)
+                    scrubThumbnails.configureCommunity(imdbId: m.libraryId, season: m.season, episode: m.episode,
+                                                       duration: d, isRealDuration: true)
                 }
             }
         case MPVProperty.seekable:
@@ -720,6 +726,18 @@ struct PlayerScreen: View {
     private var trickplayLocalCacheKey: String {
         if let m = recordMeta { return "v:\(m.libraryId):\(m.videoId)" }
         return "u:\((curURL ?? url).absoluteString)"
+    }
+
+    /// Key community trickplay EARLY off a PROVISIONAL duration from the title's `meta.runtime`, so capture
+    /// begins at the first positive timePos even when mpv never emits its `duration` event (a debrid
+    /// direct-HTTP MKV frequently doesn't). Fail-soft + idempotent: no-op without a tt id / parseable
+    /// runtime; the real mpv duration later re-keys the exact bucket and unblocks uploads.
+    private func configureCommunityTrickplayProvisional() {
+        guard let m = curMeta else { return }
+        guard let loaded = core.metaDetails?.meta, loaded.id == m.libraryId,
+              let secs = loaded.runtimeSeconds, secs > 0 else { return }
+        scrubThumbnails.configureCommunity(imdbId: m.libraryId, season: m.season, episode: m.episode,
+                                           duration: secs, isRealDuration: false)
     }
 
     private func maybeCaptureLocalTrickplay(at time: Double) {
@@ -1134,6 +1152,12 @@ struct PlayerScreen: View {
             stallRecoveries = 0
         }
         if resumeOverride != nil { currentTime = 0; duration = 0 }   // episode switch: brand-new media, reset the clock
+        // Re-key trickplay for the new source/episode and reset the local-capture throttle: otherwise the
+        // new stream's capture stays gated by the PREVIOUS stream's lastLocalTrickplayCapture, so episodes
+        // 2..N of a session captured nothing. configureCommunity is idempotent and re-keys on the new title.
+        scrubThumbnails.configure(localCacheKey: trickplayLocalCacheKey)
+        lastLocalTrickplayCapture = -1000; localTrickplayCaptureInFlight = false
+        configureCommunityTrickplayProvisional()
         appliedSize = false; appliedAutoTracks = false
         hasStartedPlaying = false; isSeekable = true; buffering = true; loadErrorMsg = ""
         autoRetryCount = 0; reconnecting = false; autoRetryTask?.cancel(); awaitedFreshSources = false

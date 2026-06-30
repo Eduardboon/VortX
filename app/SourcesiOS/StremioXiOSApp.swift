@@ -231,6 +231,21 @@ final class OrientationAppDelegate: NSObject, UIApplicationDelegate {
                      supportedInterfaceOrientationsFor window: UIWindow?) -> UIInterfaceOrientationMask {
         Self.lock
     }
+
+    /// iOS relaunches the app in the background to deliver finished background downloads, handing us a
+    /// completion handler we must call once the session drains. Stash it on DownloadManager (touching
+    /// `.shared` also re-creates the background URLSession + re-attaches its delegate, so the queued
+    /// `didFinishDownloadingTo` events actually fire and the saved file lands). Without this the download
+    /// that finished while suspended never moved its temp file -> the owner's "cannot create file" / 0-byte
+    /// save. We only adopt OUR session id; anything else is completed immediately so iOS isn't left waiting.
+    func application(_ application: UIApplication,
+                     handleEventsForBackgroundURLSession identifier: String,
+                     completionHandler: @escaping () -> Void) {
+        guard identifier == "tv.vortx.downloads.background" else { completionHandler(); return }
+        Task { @MainActor in
+            DownloadManager.shared.adoptBackgroundEvents(completionHandler: completionHandler)
+        }
+    }
 }
 
 /// Force / release landscape for the player on iPhone and iPad. `requestGeometryUpdate` actually rotates

@@ -107,6 +107,10 @@ struct TVPlayerView: View {
     // Flipping this re-renders `playerSurface` from AVPlayer to the mpv surface on the SAME TVPlayerView,
     // so the heavyweight forceMPV window rebuild is no longer needed for the common AVPlayer load failure.
     @State private var avEngineFailed = false
+    // A brief, transient note explaining WHY the engine fell back (e.g. AVPlayer cannot demux DV-in-MKV),
+    // so the silent demote the owner reported becomes an actionable explanation. Auto-clears after a few s.
+    @State private var engineNote: String?
+    @State private var engineNoteTask: Task<Void, Never>?
     // AVPlayer-only START watchdog: AVPlayer can mount, show the chrome, and silently never produce a
     // playable frame (no item error, no timePos tick). The real fix is in AVPlayerEngineController
     // (automaticallyWaitsToMinimizeStalling = false + explicit play() + the [.initial,.new] status race fix),
@@ -230,6 +234,20 @@ struct TVPlayerView: View {
             if showStreamQR, let link = shareLink {
                 StreamLinkQRView(title: isTorrentPlayback ? "Magnet link" : "Stream link", link: link)
             }
+            if let note = engineNote {
+                Text(note)
+                    .font(Theme.Typography.label)
+                    .foregroundStyle(Theme.Palette.textPrimary)
+                    .multilineTextAlignment(.center)
+                    .padding(.horizontal, Theme.Space.lg)
+                    .padding(.vertical, Theme.Space.md)
+                    .frame(maxWidth: 900)
+                    .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: Theme.Radius.card, style: .continuous))
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+                    .padding(.top, Theme.Space.xl)
+                    .transition(.opacity)
+                    .allowsHitTesting(false)
+            }
         }
         .onAppear {
             if curURL == nil {   // seed from initial request
@@ -238,6 +256,7 @@ struct TVPlayerView: View {
                 maybeRouteToDefaultExternalPlayer()
             }
             scrubThumbnails.configure(localCacheKey: trickplayLocalCacheKey)
+            configureCommunityTrickplayProvisional()
             if curHint == nil { curHint = sourceHint }
             if curBinge == nil { curBinge = bingeGroup }
             startStallWatchdog()
@@ -273,7 +292,7 @@ struct TVPlayerView: View {
             }
         }
         .onDisappear {
-            hideTask?.cancel(); loadTimeout?.cancel(); recoveryDeadline?.cancel(); autoRetryTask?.cancel(); skipFetchTask?.cancel(); stallWatchdog?.cancel(); avStartWatchdog?.cancel()
+            hideTask?.cancel(); loadTimeout?.cancel(); recoveryDeadline?.cancel(); autoRetryTask?.cancel(); skipFetchTask?.cancel(); stallWatchdog?.cancel(); avStartWatchdog?.cancel(); engineNoteTask?.cancel()
             // Community trickplay: contribute this device's captured frames as a shared sprite-sheet
             // (first-writer-wins, background, gated; no-op if the community already had a set, or on AVPlayer
             // which captures nothing). Independent of the engine-teardown rules below.
@@ -363,6 +382,9 @@ struct TVPlayerView: View {
                 }
                 currentTime = d
                 updateCurrentSkip(at: d)
+                // Ensure the community key is provisioned off meta.runtime the moment the behind-playback
+                // meta lands (idempotent; no-op once keyed), so capture starts even without a duration event.
+                configureCommunityTrickplayProvisional()
                 maybeCaptureLocalTrickplay(at: d)
                 // Live: no progress is persisted (saveProgress no-ops) and nothing is reported
                 // to the engine — a live stream has no meaningful watch position.
@@ -383,10 +405,12 @@ struct TVPlayerView: View {
         case MPVProperty.duration:
             if let d = data as? Double {
                 duration = d; maybeResume(); refreshSkipSegments(); fetchSkipTimestamps(); fetchAddonSubtitles()
-                // Community trickplay: fetch any shared sprite-sheet for this exact cut once the duration is
-                // known (fail-soft -> the existing local capture). Acts once per title.
+                // Community trickplay: re-key on the REAL playback duration (this is the authoritative bucket)
+                // and unblock uploads. Capture already started from onAppear's provisional runtime key, so a
+                // debrid MKV that never delivers this event still captures + can upload via the provisional key.
                 if d > 0, let m = curMeta {
-                    scrubThumbnails.configureCommunity(imdbId: m.libraryId, season: m.season, episode: m.episode, duration: d)
+                    scrubThumbnails.configureCommunity(imdbId: m.libraryId, season: m.season, episode: m.episode,
+                                                       duration: d, isRealDuration: true)
                 }
             }
         case MPVProperty.trackList:
@@ -1276,6 +1300,10 @@ struct TVPlayerView: View {
         curBinge = stream.behaviorHints?.bingeGroup
         curHeaders = stream.requestHeaders
         scrubThumbnails.configure(localCacheKey: trickplayLocalCacheKey)
+        // Reset the local-capture throttle on a stream switch: otherwise the new stream's capture is gated
+        // by the PREVIOUS stream's lastLocalTrickplayCapture (a high value), so episodes 2..N of a session
+        // captured nothing until playback passed that old timestamp.
+        lastLocalTrickplayCapture = -1000; localTrickplayCaptureInFlight = false
         sourceHops = 0; exhaustedURLs = []   // a deliberate pick resets the failover budget (failover restores it)
         recoveryDeadline?.cancel(); recoveryDeadline = nil   // fresh attempt re-arms the overall recovery cap
         torrentWarmupsUsed = 0; torrentStatus = nil; stallRecoveries = 0
@@ -1603,8 +1631,36 @@ struct TVPlayerView: View {
         guard useAVPlayerEngine, isAVPlayerActive else { return false }
         avStartWatchdog?.cancel(); avStartWatchdog = nil
         coordinator.player?.stop()
+        // AVPlayer can't demux this container (commonly DV-in-MKV, or Profile 7 dual-layer): surface why,
+        // so the demote stops being silent and the user knows to pick an MP4 source for true Dolby Vision.
+        showEngineNote("AVPlayer can't play this file (likely Dolby Vision in MKV). Using the built-in player, which tone-maps to HDR10/SDR. For true Dolby Vision, pick an MP4 source.")
         avEngineFailed = true
         return true
+    }
+
+    /// Show a brief player toast and auto-clear it. Used to surface the AVPlayer->libmpv fallback reason.
+    private func showEngineNote(_ text: String) {
+        engineNote = text
+        engineNoteTask?.cancel()
+        engineNoteTask = Task { @MainActor in
+            try? await Task.sleep(for: .seconds(6))
+            guard !Task.isCancelled else { return }
+            engineNote = nil
+        }
+    }
+
+    /// Key community trickplay EARLY off a PROVISIONAL duration from the title's `meta.runtime`, so capture
+    /// begins at the first positive timePos even when mpv never emits its `duration` event (a debrid
+    /// direct-HTTP MKV frequently doesn't). Fail-soft + idempotent: no-op without a tt id or a parseable
+    /// runtime; the real mpv duration later re-keys the exact bucket and unblocks uploads. Mirrors the
+    /// duration-event call's identity (libraryId + season/episode).
+    private func configureCommunityTrickplayProvisional() {
+        guard let m = curMeta else { return }
+        // The loaded meta carries the human runtime; use it only when it is THIS title's meta.
+        guard let loaded = core.metaDetails?.meta, loaded.id == m.libraryId,
+              let secs = loaded.runtimeSeconds, secs > 0 else { return }
+        scrubThumbnails.configureCommunity(imdbId: m.libraryId, season: m.season, episode: m.episode,
+                                           duration: secs, isRealDuration: false)
     }
 
     /// AVPlayer-only START watchdog. AVPlayer can mount and present its chrome yet never produce a playable
@@ -2156,6 +2212,8 @@ struct TVPlayerView: View {
             prepareTorrent(pre.stream)
             curURL = u
             scrubThumbnails.configure(localCacheKey: trickplayLocalCacheKey)
+            // Reset the local-capture throttle on the in-place episode switch (same reason as switchStream).
+            lastLocalTrickplayCapture = -1000; localTrickplayCaptureInFlight = false
             // @MainActor: the synchronous CoreBridge calls below (loadMeta / streamGroups ->
             // addonNamesByBase, which lazily mutates addonNamesCache) are main-actor-only. A bare
             // Task runs its pre-await body on a background thread, racing the dictionary against
@@ -2210,6 +2268,8 @@ struct TVPlayerView: View {
                     curURL = u
                     curIsLive = isLiveMeta(newMeta) && !s.isTorrent
                     scrubThumbnails.configure(localCacheKey: trickplayLocalCacheKey)
+                    // Reset the local-capture throttle on this in-place episode switch (same reason as switchStream).
+                    lastLocalTrickplayCapture = -1000; localTrickplayCaptureInFlight = false
                     resumeSeconds = await account.resumeOffset(for: newMeta)
                     loadIntoPlayer(u, headers: curHeaders, live: curIsLive)
                     startLoadTimeout()

@@ -309,8 +309,12 @@ struct SettingsView: View {
     private var diskCacheFooter: String {
         let base = String(localized: "A bigger streaming cache buffers more video on disk so you can seek minutes ahead without re-buffering. Unlimited is still capped to half your free storage and the cache clears when a title finishes, so it never fills your Apple TV.")
         guard diskCacheBytes != 0 else { return base }
-        let usage = DiskCacheSetting.humanReadable(DiskCacheSetting.currentUsageBytes)
-        return base + " " + String(localized: "Current cache: \(usage).")
+        // currentUsageBytes sums the on-disk mpv-cache dir, which stays EMPTY on this MPVKit build (the
+        // buffer is RAM-resident, not offloaded to disk), so it always read "0 KB" and looked broken. Show
+        // the real RAM-bounded budget the player will actually use instead (floored at 64 MiB, clamped to
+        // the device-safe ceiling), which is an honest non-zero number visible in Settings.
+        let budget = DiskCacheSetting.humanReadable(DiskCacheSetting.resolvedMaxBytes())
+        return base + " " + String(localized: "Cache budget: \(budget).")
     }
 
     private var effectiveDirectLinksOnly: Bool {

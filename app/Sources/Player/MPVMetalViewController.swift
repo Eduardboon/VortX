@@ -257,6 +257,11 @@ final class MPVMetalViewController: PlatformViewController {
             // soundbar fix is the sample rate below, not the mode.
             let mode: AVAudioSession.Mode = AudioOutputMode.current == .stereo ? .default : .moviePlayback
             try session.setCategory(.playback, mode: mode, options: [])
+            // Request 48 kHz BEFORE setActive: HDMI/eARC links run at 48 kHz, so a 48 kHz source
+            // (TrueHD/DD+/most movies) passes through un-resampled instead of the session sitting at 44.1 kHz
+            // and forcing a downsample. The OS clamps to a true 44.1k-only sink (no-op there). The tvOS
+            // sampleRatePolicy below still pins mpv's resampler to whatever rate the route opens at (#78).
+            try? session.setPreferredSampleRate(48_000)
             try session.setActive(true)
             // Read the route FIRST: the multichannel decision below depends on it.
             outputPortType = session.currentRoute.outputs.first?.portType
@@ -267,9 +272,11 @@ final class MPVMetalViewController: PlatformViewController {
             // intrinsic max BEFORE opting into multichannel content, so it reflects the route itself.
             let intrinsicMaxChannels = session.maximumOutputNumberOfChannels
             NSLog("[#78 audio] route=\(outputPortType?.rawValue ?? "nil") maxOutChannels=\(intrinsicMaxChannels) sampleRate=\(session.sampleRate)")
-            // #78: feed the route's OWN rate back as the preferred rate so the AudioUnit opens at a rate the
-            // locked Atmos/eARC route actually accepts (a hint the OS clamps; on every other route the session
-            // already reports its native rate, so this is a no-op there).
+            // #78: re-assert the route's OWN realized rate as the preferred rate so the AudioUnit opens at a
+            // rate the locked Atmos/eARC route actually accepts. This backstops the pre-activation 48 kHz hint
+            // above: if the route opened at its native rate (already 48k on eARC, or a different fixed rate),
+            // this pins to that realized rate; on every other route the session already reports its native rate
+            // so this is a no-op. Keep it (do NOT remove): it is part of the #78 eARC-silence fix.
             if session.sampleRate >= 8000 { try? session.setPreferredSampleRate(session.sampleRate) }
             // #88 / #78: advertise multichannel content ONLY on routes that can actually OPEN a multichannel
             // layout. AirPods take a system head-tracked Spatial Audio layout. For wired/receiver routes we
@@ -810,7 +817,14 @@ final class MPVMetalViewController: PlatformViewController {
             #if os(macOS)
             let ramCeiling: Int64 = 1_024 * 1024 * 1024   // Mac: out-of-process server + swap, generous
             #else
-            let ramCeiling: Int64 = PerformanceMode.reduced ? 128 * 1024 * 1024 : 256 * 1024 * 1024
+            // DEVICE-SOAK ITEM: the prior flat 256 MiB ceiling masked the Settings slider and starved the
+            // read-ahead to ~25-30s on debrid (the owner had 120-200s before). The ATV 4K (4 GB + memory
+            // entitlement) holds ~75-90s at 4K within 768 MiB, ~3x runway, which also resolves the lag and
+            // ~7 dropped frames (the buffer was draining on CDN dips). 768 MiB is deliberately BELOW the
+            // ~700 MB+ unclamped level that jetsam-killed the device; keep ATV HD (reduced) tight at 128 MiB.
+            // The player-teardown straddle that caused the earlier whole-device hang is fixed separately, so
+            // this is the buffer's first real restore. If it jetsams on soak, step 768 -> 512 MiB.
+            let ramCeiling: Int64 = PerformanceMode.reduced ? 128 * 1024 * 1024 : 768 * 1024 * 1024
             #endif
             let applied = min(DiskCacheSetting.resolvedMaxBytes(), ramCeiling)
             mpv_set_property_string(mpv, "demuxer-max-bytes", String(applied))

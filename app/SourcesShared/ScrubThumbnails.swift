@@ -36,6 +36,11 @@ final class ScrubThumbnailsStore: ObservableObject {
     private var communityEpisode: Int?
     private var communityDurationBucket = 0
     private var communitySrcHeight = 0
+    /// True only once we have keyed on the REAL playback duration (mpv's `duration` event), not the
+    /// provisional `meta.runtime` estimate. The key is allowed to form provisionally so capture starts at
+    /// the first positive `timePos` (a debrid MKV may never deliver a `duration` event), but an UPLOAD is
+    /// gated on this so a wrong provisional bucket can never write a poisoned community set.
+    private var hasRealDuration = false
     /// Raw JPEG frames captured THIS session, time-ordered build input for the upload sprite-sheet.
     private var sessionFrames: [CommunityTrickplay.CapturedFrame] = []
     /// Frame count at the last upload. Throttles progressive re-uploads and lets the teardown flush skip a
@@ -53,30 +58,44 @@ final class ScrubThumbnailsStore: ObservableObject {
         communitySheet = nil
         communityAlreadyExists = false
         communityKey = nil
+        hasRealDuration = false
         sessionFrames = []
         lastUploadedCount = 0
     }
 
-    /// Plumb the shareable identity + kick off the L1 community fetch. Call ONCE per title after the duration
-    /// is known (the content key needs it). Fully fail-soft: a miss / error / offline leaves the player on
-    /// local capture. Safe to call repeatedly; it acts only the first time a real key resolves.
-    func configureCommunity(imdbId: String?, season: Int?, episode: Int?, duration: Double, enabled: Bool = CommunityTrickplay.isEnabled) {
-        guard enabled, communityKey == nil, let imdbId,
+    /// Plumb the shareable identity + kick off the L1 community fetch. Call EARLY with a provisional duration
+    /// derived from `meta.runtime` (so capture can begin at the first positive `timePos`, since a debrid MKV
+    /// may never deliver mpv's `duration` event), then AGAIN with `isRealDuration: true` once the real mpv
+    /// duration arrives. The provisional call keys + fetches but never uploads; the real call re-keys if the
+    /// duration bucket changed and flips `hasRealDuration` so uploads can begin. Fully fail-soft.
+    func configureCommunity(imdbId: String?, season: Int?, episode: Int?, duration: Double,
+                            isRealDuration: Bool = true, enabled: Bool = CommunityTrickplay.isEnabled) {
+        guard enabled, let imdbId, duration > 0,
               let key = CommunityTrickplay.contentKey(imdbId: imdbId, season: season, episode: episode, duration: duration)
         else {
             // Diagnose an empty server table: log WHY we never key (the usual culprit is a non-`tt` libraryId,
             // e.g. a tmdb:/kitsu: id, so contentKey returns nil and nothing is ever captured for upload).
             if enabled, communityKey == nil {
-                NSLog("[trickplay] community NOT keyed (need a tt-imdb id + duration): imdb=%@ dur=%.0f", imdbId ?? "nil", duration)
+                NSLog("[trickplay] community NOT keyed (need a tt-imdb id + duration>0): imdb=%@ dur=%.0f", imdbId ?? "nil", duration)
             }
             return
         }
-        NSLog("[trickplay] community keyed: %@ (imdb=%@)", key, imdbId)
+        // Mark the real-duration arrival regardless of whether the key changes, so uploads unblock.
+        if isRealDuration { hasRealDuration = true }
+        // No-op if already keyed on this exact content key (idempotent across repeated calls). The real
+        // duration re-keys ONLY when its bucket differs from the provisional one.
+        if communityKey == key { return }
+        if communityKey != nil, !isRealDuration { return }   // keep the provisional key until the real one lands
+        let rekeying = communityKey != nil
+        NSLog("[trickplay] community %@: %@ (imdb=%@ real=%@)", rekeying ? "re-keyed" : "keyed", key, imdbId, isRealDuration ? "yes" : "no")
         communityKey = key
         communityImdb = imdbId
         communitySeason = season
         communityEpisode = episode
         communityDurationBucket = CommunityTrickplay.durationBucket(duration)
+        // A re-key under a new bucket invalidates a fetched sheet (it belonged to the old key); the new
+        // fetch below replaces it. Captured session frames stay valid (they are time-indexed, not bucketed).
+        if rekeying { communitySheet = nil; communityAlreadyExists = false }
         Task { [weak self] in
             let sheet = await CommunityTrickplay.fetch(key: key)
             await MainActor.run {
@@ -137,7 +156,9 @@ final class ScrubThumbnailsStore: ObservableObject {
         // worker is overwrite-wins, so each push just improves the stored set; capture is ~every 10s, so a
         // minute is ~6 frames.
         let perMinute = max(1, Int(60.0 / Self.captureInterval))
-        guard !communityAlreadyExists, CommunityTrickplay.isEnabled,
+        // Gate on hasRealDuration: never upload under a provisional (meta.runtime) bucket, which could be
+        // wrong and would write a poisoned set under a key real players never read.
+        guard hasRealDuration, !communityAlreadyExists, CommunityTrickplay.isEnabled,
               sessionFrames.count >= lastUploadedCount + perMinute,
               let key = communityKey, let imdb = communityImdb else { return }
         pushUpload(key: key, imdb: imdb)
@@ -147,7 +168,9 @@ final class ScrubThumbnailsStore: ObservableObject {
     /// disabled / no key / the community already had a set / no new coverage since the last upload.
     func finishAndUploadIfNeeded(srcHeight: Int = 0) {
         if srcHeight > 0 { communitySrcHeight = srcHeight }
-        guard !communityAlreadyExists, CommunityTrickplay.isEnabled,
+        // Gate on hasRealDuration too: a teardown before the real duration ever arrived must NOT flush a
+        // provisional-bucket set to the worker.
+        guard hasRealDuration, !communityAlreadyExists, CommunityTrickplay.isEnabled,
               let key = communityKey, let imdb = communityImdb,
               sessionFrames.count >= 2, sessionFrames.count > lastUploadedCount else { return }
         pushUpload(key: key, imdb: imdb)

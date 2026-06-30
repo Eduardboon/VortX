@@ -581,7 +581,10 @@ struct iOSHomeView: View {
             #endif
             .sheet(isPresented: $showSignIn) { iOSSignInView() }
             .navigationDestination(for: FeaturedHeroItem.self) { item in
-                iOSDetailView(id: item.id, type: item.type, title: item.name)
+                // Thread the hub card's already-resolved art so the detail hero never blanks while (or if)
+                // Cinemeta meta is nil for a new/unreleased title.
+                iOSDetailView(id: item.id, type: item.type, title: item.name,
+                              seedBackdrop: item.backdrop, seedLogo: item.logo)
             }
             .navigationDestination(for: HubTarget.self) { target in
                 iOSCategoryBrowse(target: target, path: $path)
@@ -750,10 +753,11 @@ struct iOSLibraryView: View {
         NavigationStack(path: $path) {
             ScrollView {
                 #if !os(tvOS)
-                // Offline downloads (#30): a section at the top of Library, hidden when empty. Plays from
-                // the local file, with pause/resume/cancel/delete + total storage used.
+                // Downloads is reachable ONLY through this single pill inside Library (owner's final
+                // directive): no inline DownloadsView mount at the top, no Home/Discover hub tile. The pill
+                // shows only when there is at least one download and pushes the standalone screen.
                 if !downloads.records.isEmpty {
-                    DownloadsView(onPlay: { launch in downloadPlayer = launch })
+                    iOSLibraryDownloadsPill(count: downloads.records.count)
                         .padding(.horizontal, Theme.Space.md)
                         .padding(.bottom, Theme.Space.lg)
                 }
@@ -800,7 +804,10 @@ struct iOSLibraryView: View {
             .background(Theme.Palette.canvas.ignoresSafeArea())
             .stremioWordmarkTitle(String(localized: "Library"), isActive: isActive)
             .navigationDestination(for: FeaturedHeroItem.self) { item in
-                iOSDetailView(id: item.id, type: item.type, title: item.name)
+                // Thread the hub card's already-resolved art so the detail hero never blanks while (or if)
+                // Cinemeta meta is nil for a new/unreleased title.
+                iOSDetailView(id: item.id, type: item.type, title: item.name,
+                              seedBackdrop: item.backdrop, seedLogo: item.logo)
             }
             #if !os(tvOS)
             .iOSPlayerCover($downloadPlayer, account: account, core: core)
@@ -998,9 +1005,47 @@ struct DownloadsView: View {
     }
 }
 
+/// The single Downloads entry point: a full-width pill inside the Library tab (owner's final directive).
+/// A `NavigationLink` that pushes the standalone `iOSDownloadsScreen`; shown only when there is at least
+/// one download. Replaces both the old top-of-Library inline mount and the Home/Discover hub tile.
+#if !os(tvOS)
+struct iOSLibraryDownloadsPill: View {
+    let count: Int
+    var body: some View {
+        NavigationLink {
+            iOSDownloadsScreen()
+        } label: {
+            HStack(spacing: Theme.Space.sm) {
+                Image(systemName: "arrow.down.circle.fill")
+                    .font(.system(size: 22, weight: .semibold))
+                    .foregroundStyle(Theme.Palette.accent)
+                VStack(alignment: .leading, spacing: 1) {
+                    Text("Downloads")
+                        .font(Theme.Typography.cardTitle)
+                        .foregroundStyle(Theme.Palette.textPrimary)
+                    Text(count == 1 ? "1 item saved offline" : "\(count) items saved offline")
+                        .font(.system(size: 12, weight: .medium))
+                        .foregroundStyle(Theme.Palette.textSecondary)
+                }
+                Spacer()
+                Image(systemName: "chevron.right")
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundStyle(Theme.Palette.textSecondary)
+            }
+            .padding(.horizontal, Theme.Space.md)
+            .padding(.vertical, Theme.Space.sm)
+            .frame(maxWidth: .infinity)
+            .background(Theme.Palette.surface1, in: RoundedRectangle(cornerRadius: Theme.Radius.card, style: .continuous))
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+    }
+}
+#endif
+
 /// A standalone Downloads screen: the same `DownloadsView` list, plus its own player cover, so it can be
-/// pushed from the Home / Discover Collections hub's Downloads tile (a second entry point besides the
-/// inline Library section). Pulls account/core from the environment to host the local-file player.
+/// pushed from the Library tab's Downloads pill. Pulls account/core from the environment to host the
+/// local-file player.
 struct iOSDownloadsScreen: View {
     @EnvironmentObject private var account: StremioAccount
     @EnvironmentObject private var core: CoreBridge
@@ -1017,6 +1062,7 @@ struct iOSDownloadsScreen: View {
         .navigationTitle("Downloads")
         .navigationBarTitleDisplayMode(.inline)
         #endif
+        .macBackAffordance()   // macOS in-content Back + Esc / Cmd-[ (no toolbar back exists)
         .iOSPlayerCover($downloadPlayer, account: account, core: core)
     }
 }
@@ -1063,10 +1109,33 @@ struct iOSSearchView: View {
                     // SwiftUI's rapid toolbar reconciliation it threw inside _insertNewItemWithItemIdentifier
                     // (the same Mac crash class the wordmark/sign-in toolbar items are #if os(iOS)-gated for).
                     #if os(macOS)
-                    TextField("Movies or series", text: $query)
-                        .textFieldStyle(.roundedBorder)
+                    // A clearly visible search field: a magnifier glyph + a plain TextField on a surface
+                    // capsule with explicit text/placeholder colors. The previous `.roundedBorder` field was
+                    // near-invisible on the dark canvas (system chrome, low contrast) — the owner's "search
+                    // doesn't show on Mac". This reads as an obvious search box and submits on Return.
+                    HStack(spacing: Theme.Space.sm) {
+                        Image(systemName: "magnifyingglass")
+                            .font(.system(size: 15, weight: .semibold))
+                            .foregroundStyle(Theme.Palette.textSecondary)
+                        TextField(text: $query) {
+                            Text("Search movies or series").foregroundStyle(Theme.Palette.textTertiary)
+                        }
+                        .textFieldStyle(.plain)
+                        .font(Theme.Typography.body)
+                        .foregroundStyle(Theme.Palette.textPrimary)
                         .onSubmit { core.suggestSearch(query); core.search(query) }
-                        .padding(.horizontal, Theme.Space.md)
+                        if !query.isEmpty {
+                            Button { query = ""; core.search("") } label: {
+                                Image(systemName: "xmark.circle.fill").foregroundStyle(Theme.Palette.textTertiary)
+                            }
+                            .buttonStyle(.plain)
+                        }
+                    }
+                    .padding(.horizontal, Theme.Space.md)
+                    .padding(.vertical, Theme.Space.sm)
+                    .background(Theme.Palette.surface1, in: Capsule())
+                    .overlay(Capsule().stroke(Theme.Palette.surface2, lineWidth: 1))
+                    .padding(.horizontal, Theme.Space.md)
                     #endif
 
                     if !history.isEmpty && !isTyping { historySection }
@@ -1078,7 +1147,10 @@ struct iOSSearchView: View {
             .background(Theme.Palette.canvas.ignoresSafeArea())
             .stremioWordmarkTitle(String(localized: "Search"), isActive: isActive)
             .navigationDestination(for: FeaturedHeroItem.self) { item in
-                iOSDetailView(id: item.id, type: item.type, title: item.name)
+                // Thread the hub card's already-resolved art so the detail hero never blanks while (or if)
+                // Cinemeta meta is nil for a new/unreleased title.
+                iOSDetailView(id: item.id, type: item.type, title: item.name,
+                              seedBackdrop: item.backdrop, seedLogo: item.logo)
             }
             #if os(iOS)
             .searchable(text: $query, prompt: "Movies or series")
@@ -1312,7 +1384,10 @@ struct iOSDiscoverView: View {
             .background(Theme.Palette.canvas.ignoresSafeArea())
             .stremioWordmarkTitle(String(localized: "Discover"), isActive: isActive)
             .navigationDestination(for: FeaturedHeroItem.self) { item in
-                iOSDetailView(id: item.id, type: item.type, title: item.name)
+                // Thread the hub card's already-resolved art so the detail hero never blanks while (or if)
+                // Cinemeta meta is nil for a new/unreleased title.
+                iOSDetailView(id: item.id, type: item.type, title: item.name,
+                              seedBackdrop: item.backdrop, seedLogo: item.logo)
             }
             .navigationDestination(for: HubTarget.self) { target in
                 iOSCategoryBrowse(target: target, path: $path)
@@ -1972,14 +2047,10 @@ struct PosterGrid: View {
     // Center the adaptive tracks so the cards distribute evenly across the available width. Min track
     // matches the card width: 168pt landscape pills (TMDB key required), else 116pt portrait.
     private var columns: [GridItem] {
-        // Match PosterCardiOS.macScale so the adaptive track derives fewer, bigger columns on the wide
-        // Mac window instead of cramming iPhone-sized cards across it.
-        #if os(macOS)
-        let scale: CGFloat = 1.5
-        #else
-        let scale: CGFloat = 1.0
-        #endif
-        let minTrack = (catalogPrefs.landscapeCards && apiKeys.hasTMDB ? 168 : 116) * scale
+        // The cards are now a single unified width (iOSPillMetrics.cardWidth, matching the hub pills), so the
+        // adaptive track minimum must match that exact width or the grid would derive too many columns and
+        // clip/overlap them. One source of truth keeps the grid and the cards in lockstep on iPhone + Mac.
+        let minTrack = iOSPillMetrics.cardWidth
         return [GridItem(.adaptive(minimum: minTrack), spacing: Theme.Space.sm, alignment: .center)]
     }
     var body: some View {
@@ -2347,8 +2418,11 @@ private struct PosterCardiOS: View {
     #else
     private static let macScale: CGFloat = 1.0
     #endif
-    private var cardW: CGFloat { (landscape ? 168 : 120) * Self.macScale }
-    private var cardH: CGFloat { (landscape ? 95 : 180) * Self.macScale }   // 168 * 9/16 ≈ 95
+    // Unify the card WIDTH with the hub/category/collection pills (the owner's "every pill should be the
+    // same size"). All tiles now share `iOSPillMetrics.cardWidth`; the height follows the card's own aspect
+    // (16:9 landscape, 2:3 portrait) so posters aren't distorted, only column-width-matched.
+    private var cardW: CGFloat { iOSPillMetrics.cardWidth }
+    private var cardH: CGFloat { landscape ? cardW * 9.0 / 16.0 : cardW * 3.0 / 2.0 }
 
     var body: some View {
         card.modifier(PosterContextMenu(id: id, menu: menu, onDetails: onDetails))
@@ -2563,7 +2637,53 @@ extension View {
         self
         #endif
     }
+
+    /// macOS pushed/detail views have NO toolbar back button (the whole window NSToolbar is removed to
+    /// dodge the Beta 7 crash), so a Mac user had no way to go back and the keyboard did nothing. This
+    /// overlays an in-content Back affordance in the top-leading corner AND wires Escape + Cmd-[ to pop the
+    /// NavigationStack. iOS keeps the system back button, so this is a no-op there.
+    @ViewBuilder func macBackAffordance() -> some View {
+        #if os(macOS)
+        modifier(MacBackAffordance())
+        #else
+        self
+        #endif
+    }
 }
+
+#if os(macOS)
+/// The macOS in-content Back button + Escape / Cmd-[ shortcuts, factored into a modifier so it can read
+/// `@Environment(\.dismiss)` (which pops the enclosing NavigationStack on a `navigationDestination`-pushed
+/// view). The shortcut buttons are zero-size + hidden so they only register the key equivalents.
+private struct MacBackAffordance: ViewModifier {
+    @Environment(\.dismiss) private var dismiss
+    func body(content: Content) -> some View {
+        content
+            .overlay(alignment: .topLeading) {
+                Button { dismiss() } label: {
+                    Label("Back", systemImage: "chevron.left")
+                        .labelStyle(.titleAndIcon)
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundStyle(Theme.Palette.textPrimary)
+                        .padding(.horizontal, Theme.Space.sm)
+                        .padding(.vertical, 6)
+                        .background(.ultraThinMaterial, in: Capsule())
+                }
+                .buttonStyle(.plain)
+                .padding(.leading, Theme.Space.md)
+                .padding(.top, Theme.Space.md)
+            }
+            .background(
+                // Hidden key-equivalent buttons: Escape and Cmd-[ both pop, matching macOS conventions.
+                Group {
+                    Button("") { dismiss() }.keyboardShortcut(.cancelAction).hidden()
+                    Button("") { dismiss() }.keyboardShortcut("[", modifiers: .command).hidden()
+                }
+                .frame(width: 0, height: 0)
+            )
+    }
+}
+#endif
 
 /// Cross-version empty state (ContentUnavailableView is iOS 17+; the deployment target is 16). An
 /// optional `cta` adds a primary action button below the message so empty states across the browse

@@ -489,8 +489,10 @@ struct iOSSettingsView: View {
     private var diskCacheFooter: String {
         let base = String(localized: "A bigger streaming cache buffers more video on disk so you can seek minutes ahead without re-buffering. Unlimited is still capped to half your free space and the cache clears when a title finishes, so it never fills your device.")
         guard diskCacheBytes != 0 else { return base }
-        let usage = DiskCacheSetting.humanReadable(DiskCacheSetting.currentUsageBytes)
-        return base + "\n" + String(localized: "Current cache: \(usage).")
+        // currentUsageBytes sums the on-disk mpv-cache dir, which stays EMPTY on this MPVKit build (the
+        // buffer is RAM-resident), so it always read "0 KB". Show the real RAM-bounded budget instead.
+        let budget = DiskCacheSetting.humanReadable(DiskCacheSetting.resolvedMaxBytes())
+        return base + "\n" + String(localized: "Cache budget: \(budget).")
     }
 
     /// Direct Links Only writes the flat key; turning it OFF cold-starts the embedded server so

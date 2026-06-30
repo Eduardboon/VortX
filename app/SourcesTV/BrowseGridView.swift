@@ -50,6 +50,10 @@ struct TVCollectionsHub: View {
                 .padding(.vertical, Theme.Space.lg)   // room for the focus halo
             }
         }
+        // Each hub row is its own focus section so D-pad down steps row1 -> row2 -> row3 deterministically.
+        // Without this, tvOS's raw geometric focus beam skips row 2 (the ~190pt of non-focusable chrome
+        // between rows + the 1.08 card-focus scale defeat nearest-overlap), landing focus on a row-3 tile.
+        .focusSection()
     }
 }
 
