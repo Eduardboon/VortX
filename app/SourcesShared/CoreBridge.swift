@@ -90,7 +90,7 @@ final class CoreBridge: ObservableObject {
     /// Refresh the installed-addons list (and the raw descriptors for uninstall) from ctx.profile.
     ///
     /// TOMBSTONE ENFORCEMENT (the load-bearing removal-sticks guard): `refreshAddons` is the SINGLE
-    /// point where the engine's ctx add-on set is published, and it fires on EVERY ctx change — including
+    /// point where the engine's ctx add-on set is published, and it fires on EVERY ctx change, including
     /// after the live Stremio import path (`PullAddonsFromAPI` / `switchAccount` / `refreshFromAPI`),
     /// which re-installs the whole Stremio add-on collection into the engine ctx, a tombstoned add-on
     /// among them. The `syncDown` tombstone loop only runs on a strictly-newer account `.doc` pull, so a
@@ -99,7 +99,7 @@ final class CoreBridge: ObservableObject {
     /// add-on that is in the durable removal set (`AddonTombstones`, which already folded in the web
     /// dashboard's `doc.webAddonRemovals` + `doc.vortx.deletedAddons` on syncDown) and is NOT
     /// official/protected is uninstalled from the engine and dropped from the published set, so a
-    /// dashboard deletion is honored the instant the engine re-surfaces it, on every ctx path — not only
+    /// dashboard deletion is honored the instant the engine re-surfaces it, on every ctx path, not only
     /// on sync-down. A genuine fresh RE-install later still works: `installAddon` (the single hardened
     /// installer every UI routes through) calls `AddonTombstones.forget` on a successful explicit install,
     /// so the URL leaves the set before the engine re-emits ctx and is therefore NOT suppressed here.

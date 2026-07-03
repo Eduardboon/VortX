@@ -2595,7 +2595,7 @@ struct CachedPosterImage: View {
         }
         if Task.isCancelled { return }   // scroll-away: leave `failed` false so the recycled cell reloads
         // One quick retry before latching the film placeholder, so a transient network blip on a card that
-        // stays on screen (not scrolled away) does not leave it permanently blank — the "posters lose their
+        // stays on screen (not scrolled away) does not leave it permanently blank, the "posters lose their
         // picture icon" report. Still bounded (a single retry) so a genuinely dead URL settles fast.
         try? await Task.sleep(nanoseconds: 400_000_000)
         if Task.isCancelled { return }
