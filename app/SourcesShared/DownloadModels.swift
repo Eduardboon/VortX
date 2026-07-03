@@ -81,6 +81,15 @@ struct DownloadRecord: Codable, Identifiable, Hashable {
     /// Human-readable failure reason when `state == .failed`; nil otherwise.
     var errorText: String?
 
+    /// The live `URLSessionTask.taskIdentifier` of the transfer filling this record, persisted so a
+    /// relaunch can map a still-running background task (byte-download OR HLS asset) back to its record
+    /// and re-wire pause/cancel to the real task. `taskIdentifier` is stable for the life of a task on a
+    /// background session and survives app suspend/relaunch (the OS keeps the task running). Nil for a
+    /// record with no live task (queued / paused / completed / failed). This is a RECONNECT HINT only:
+    /// reconciliation also falls back to matching `localFilename` (byte) / `id` (HLS) via `taskDescription`,
+    /// so a stale or missing identifier never strands a good download.
+    var taskIdentifier: Int?
+
     /// A completed HLS offline download (its media is a `.movpkg`, playable only by AVPlayer).
     var isHLSOffline: Bool { hlsRelativePath != nil }
 
@@ -89,7 +98,7 @@ struct DownloadRecord: Codable, Identifiable, Hashable {
          isTorrent: Bool, headers: [String: String]?, remoteURL: String, localFilename: String,
          hlsRelativePath: String? = nil,
          bytesTotal: Int64 = 0, bytesDone: Int64 = 0, state: DownloadState = .queued,
-         addedAt: Date = Date(), errorText: String? = nil) {
+         addedAt: Date = Date(), errorText: String? = nil, taskIdentifier: Int? = nil) {
         self.id = id
         self.contentId = contentId
         self.videoId = videoId
@@ -110,6 +119,7 @@ struct DownloadRecord: Codable, Identifiable, Hashable {
         self.state = state
         self.addedAt = addedAt
         self.errorText = errorText
+        self.taskIdentifier = taskIdentifier
     }
 
     /// Rebuild the `PlaybackMeta` for play-from-local. Identical to the meta the streaming play path

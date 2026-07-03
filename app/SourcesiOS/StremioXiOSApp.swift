@@ -79,6 +79,14 @@ struct StremioXiOSApp: App {
                     DispatchQueue.main.asyncAfter(deadline: .now() + 8) {
                         ProfileStore.shared.bootstrapSync()
                     }
+                    // Reconnect any offline download still running from a previous launch: a background
+                    // AVAssetDownloadURLSession / .background byte session keeps its tasks alive after the
+                    // app is killed, but the new process has empty task<->record maps, so pause/cancel would
+                    // silently no-op until we re-adopt them. Idempotent + fail-soft; a no-op when there are
+                    // no in-flight downloads. (The background-relaunch path also calls this via
+                    // adoptBackgroundEvents, but that only fires when iOS wakes us to deliver FINISHED events,
+                    // not on an ordinary user-tapped launch.)
+                    DownloadManager.shared.reconnectInFlightDownloads()
                     if core.library == nil { core.loadLibrary() }   // so the F5 sweep below has data to work with
                     // Account-owns-everything launch wiring (additive, fail-soft):
                     //  - hydrate the engine from the VortX account's owned add-ons when it boots degraded

@@ -1446,7 +1446,7 @@ struct CoreStreamList: View {
                     // Stays FOCUSABLE while gated (a disabled button is unfocusable on tvOS, which
                     // dumped focus onto the Quality chip); the action is simply inert until the
                     // add-ons settle, then the same focused button springs alive in place.
-                    Button { if watchReady { play(best) } } label: {
+                    Button { if watchReady { playBest(best, in: groups) } } label: {
                         if watchReady {
                             // watchLabel derives from the EXACT stream this button plays, so it
                             // can never promise a quality it doesn't deliver. A saved resume position
@@ -1715,6 +1715,37 @@ struct CoreStreamList: View {
     /// treats this as a direct stream automatically (no warm-up, no `closeTorrent`).
     private func play(_ stream: CoreStream) {
         Task { await playResolving(stream) }
+    }
+
+    /// AUTO-PICK play (the "Watch Now" button + resolution long-press): race the top few CACHED sources in
+    /// parallel so we reach a genuinely-cached link fast instead of committing to `best` alone, which — when
+    /// `best` is a false-cached row (an add-on ⚡ that this account does not actually hold) — serially times
+    /// out before the user reaches a real one. `groups` is already StreamRanking-ordered (continuity / binge /
+    /// pin applied), so flattening it preserves that order as the candidate order. FAIL-SOFT: if the parallel
+    /// race yields nothing (no confirmed-cached row, or every leg failed) it falls straight through to today's
+    /// single-resolve `play(best)`, so the no-key / no-cache path is unchanged. A MANUAL row tap still calls
+    /// `play(_:)` directly (`streamRow`), resolving exactly the row the user chose.
+    private func playBest(_ best: CoreStream, in groups: [CoreStreamSourceGroup]) {
+        Task { await playBestResolving(best, in: groups) }
+    }
+
+    @MainActor private func playBestResolving(_ best: CoreStream, in groups: [CoreStreamSourceGroup]) async {
+        // Candidate order = the already-ranked list order (continuity/binge/pin preserved), best first.
+        let candidates = groups.flatMap(\.streams)
+        if let win = await DebridCoordinator.shared.resolveFirstPlayable(
+            candidates: candidates, cachedHashes: debridCache.cachedHashes,
+            cachedUsenetURLs: debridCache.cachedUsenetURLs) {
+            // A parallel-cached winner is a remote direct link: present it exactly as the single-resolve
+            // debrid branch does (engine wired for state, torrent:false, no /create, no closeTorrent).
+            core.loadEnginePlayer(for: win.stream)
+            presenter.request = PlaybackRequest(url: win.ref.url, title: title, meta: meta, episodes: episodes,
+                                                sourceHint: StreamRanking.signature(win.stream), torrent: false,
+                                                bingeGroup: win.stream.behaviorHints?.bingeGroup,
+                                                headers: win.stream.requestHeaders)
+            return
+        }
+        // No parallel-cached winner: today's single-resolve path on the ranked best, unchanged.
+        await playResolving(best)
     }
 
     @MainActor private func playResolving(_ stream: CoreStream) async {

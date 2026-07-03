@@ -26,5 +26,7 @@ enum WhatsNew {
         "Scrub-preview thumbnails now build and share from every title you watch, including everything opened from the Streaming Services, Trending and genre collections. Previously those plays were skipped, so timeline previews stayed empty; now every watch makes scrubbing better for everyone.",
         "Trailers now play straight from your own device at up to 1080p, resolved on the spot instead of routed through a server, so they start faster and look sharper. The ambient trailer behind the hero uses the same path.",
         "Cached sources start faster: when a source that looks cached is not actually ready on your account, the player now moves on in a couple of seconds instead of waiting out a long timeout, so you reach a source that plays much sooner.",
+        "Pause and cancel now keep working on a download even after you fully quit and reopen the app: an in-progress download that kept running in the background is picked back up on launch, so its Pause and Cancel controls act on the real transfer again instead of doing nothing.",
+        "Watch Now reaches a playable cached source much faster: it now checks the top few cached sources at once and plays the first one that is really ready on your account, instead of trying them one at a time. Picking a specific source yourself still plays exactly that one.",
     ]
 }

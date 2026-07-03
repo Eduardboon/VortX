@@ -1874,6 +1874,28 @@ struct iOSDetailView: View {
         // a zero-await nil → today's path). On a debrid hit we play a remote direct URL with isTorrent:false
         // and DON'T run primePlayback (no `/create`); otherwise `prime` stays true and the path is exactly
         // today's (primePlayback → engine + torrent prime), so the no-key path is byte-identical.
+        //
+        // AUTO-PICK PARALLELISM: this is the top-cached "Watch" path, so race the top few CACHED candidates
+        // (StreamRanking order preserved) concurrently and play the FIRST that resolves — the user reaches a
+        // genuinely-cached source in ~2-4s instead of committing to `movieBest` alone when it is a
+        // false-cached row. Fail-soft: a nil race result falls straight through to the single-resolve on
+        // `movieBest` below, so the no-key / no-cache path is byte-identical. (A manual source-row tap uses
+        // `playStream`, which stays single-resolve on the exact chosen row.)
+        let candidates = StreamRanking.rankedGroups(displayGroups(core.streamGroups()), pin: sourcePin,
+                                                    debridCachedHashes: debridCache.cachedHashes).flatMap(\.streams)
+        if let win = await DebridCoordinator.shared.resolveFirstPlayable(
+            candidates: candidates, cachedHashes: debridCache.cachedHashes,
+            cachedUsenetURLs: debridCache.cachedUsenetURLs) {
+            core.loadEnginePlayer(for: win.stream)
+            let pm = moviePlaybackMeta
+            let resumeSeconds = fromStart ? 0 : await resume(pm)
+            presentation = .player(PlayerLaunch(url: win.ref.url, title: pm.name, headers: win.stream.requestHeaders,
+                                                resume: resumeSeconds, meta: pm,
+                                                qualityText: StreamRanking.signature(win.stream),
+                                                bingeGroup: win.stream.behaviorHints?.bingeGroup,
+                                                isTorrent: false, debridRef: win.ref))
+            return
+        }
         let ref = await DebridCoordinator.shared.resolvedPlaybackRef(for: stream)
         guard let url = ref?.url ?? stream.playableURL else { return }
         let prime = ref == nil
@@ -2469,6 +2491,7 @@ struct iOSEpisodeStreams: View {
                     cachedHashes: debridCache.cachedHashes,
                     cachedUsenetURLs: debridCache.cachedUsenetURLs,
                     play: { stream, url in Task { await play(stream, url: url) } },
+                    playBest: { candidates in Task { await playBest(candidates) } },
                     download: episodeDownloadHandler
                 )
                 .padding(.horizontal, Theme.Space.md)
@@ -2645,6 +2668,42 @@ struct iOSEpisodeStreams: View {
                                             resume: await resume(pm), meta: pm,
                                             qualityText: StreamRanking.signature(stream),
                                             isTorrent: isTorrent, debridRef: ref)
+    }
+
+    /// AUTO-PICK play for the episode "Watch in <quality>" button: race the top few CACHED candidates
+    /// (ranking order preserved) in parallel and play the FIRST that resolves, so the user reaches a
+    /// genuinely-cached source fast instead of committing to the single ranked best when it is a
+    /// false-cached row. FAIL-SOFT: a nil race result falls back to today's single-resolve on the ranked
+    /// best (`play`), so the no-key / no-cache path is byte-identical. A MANUAL row tap / Quality pick still
+    /// goes through `play(_:url:)` on the exact chosen row.
+    private func playBest(_ candidates: [CoreStream]) async {
+        guard !preparing else { return }
+        // Hold `preparing` for the whole race so a second Watch tap can't launch a duplicate resolve. It is
+        // RELEASED before the single-resolve fallback below, which sets its own guard (`play` early-returns
+        // while `preparing`), so the fallback path is unchanged.
+        preparing = true
+        let ep = video.season.flatMap { s in video.episode.map { DebridEpisode(season: s, episode: $0) } }
+        if let win = await DebridCoordinator.shared.resolveFirstPlayable(
+            candidates: candidates, episode: ep, cachedHashes: debridCache.cachedHashes,
+            cachedUsenetURLs: debridCache.cachedUsenetURLs) {
+            defer { preparing = false }
+            core.loadEnginePlayer(for: win.stream)
+            lastBinge = win.stream.behaviorHints?.bingeGroup
+            torrentPrime?.cancel(); torrentPrime = nil   // debrid direct link: no torrent prime
+            let name = "\(meta.name)  ·  S\(video.season ?? season)E\(video.episodeNumber)"
+            let pm = PlaybackMeta(libraryId: meta.id, videoId: video.id, type: "series",
+                                  name: meta.name, poster: video.thumbnail ?? meta.poster,
+                                  season: video.season, episode: video.episode)
+            player = iOSDetailView.PlayerLaunch(url: win.ref.url, title: name, headers: win.stream.requestHeaders,
+                                                resume: await resume(pm), meta: pm,
+                                                qualityText: StreamRanking.signature(win.stream),
+                                                isTorrent: false, debridRef: win.ref)
+            return
+        }
+        preparing = false   // release before the fallback, which re-guards on `preparing` inside `play`
+        // No parallel-cached winner: today's single-resolve on the ranked best (first playable candidate).
+        guard let best = candidates.first(where: { $0.playableURL != nil }), let url = best.playableURL else { return }
+        await play(best, url: url)
     }
 
     #if !os(tvOS)
@@ -2856,6 +2915,13 @@ struct iOSSourceList: View {
     /// keep the default true — there the control bar is the only primary action.
     var showsPrimaryControls = true
     let play: (CoreStream, URL) -> Void
+    /// AUTO-PICK play for the primary "Watch in <quality>" button ONLY: hands the caller the ranked
+    /// candidate list (best first) so it can race the top few CACHED sources in parallel and play the first
+    /// that resolves, reaching a genuinely-cached link fast instead of committing to `best` alone. Optional:
+    /// when nil, the Watch button falls back to the single-resolve `play(best, url)` (byte-identical to
+    /// before). The per-row taps and the Quality picker NEVER use this — a user choosing a specific row still
+    /// resolves exactly that row through `play`.
+    var playBest: (([CoreStream]) -> Void)? = nil
     /// Offline download of a chosen source row (`#30`). Optional so call sites that don't support
     /// downloads (e.g. tvOS, where the whole feature is `#if !os(tvOS)`-gated) pass nil and no Download
     /// affordance renders. `url` is resolved by the caller EXACTLY as the play path resolves it.
@@ -3025,7 +3091,9 @@ struct iOSSourceList: View {
                     // Watch-Now waits until every add-on has answered (or the settle timeout fired), so one
                     // press plays the best of ALL sources, not the best of whoever replied first — the tvOS
                     // gate. The Quality picker stays live so a manual pick is always available immediately.
-                    Button { play(best, url) } label: {
+                    // AUTO-PICK: race the top cached candidates in parallel via `playBest` when the caller
+                    // wired it (best first, ranking order preserved), else the single-resolve `play(best)`.
+                    Button { if let playBest { playBest(groups.flatMap(\.streams)) } else { play(best, url) } } label: {
                         if loading {
                             HStack(spacing: Theme.Space.sm) {
                                 ProgressView().tint(Theme.Palette.onAccent)

@@ -173,17 +173,19 @@ final class DownloadManager: NSObject, ObservableObject {
 
     func pause(id: UUID) {
         #if os(iOS)
-        // HLS asset downloads pause by suspending the live task (no resume-data mechanism).
+        // HLS asset downloads pause by suspending the live task (no resume-data mechanism). Clear the
+        // persisted identifier: a paused record must never be reconnected as in-flight (resume re-creates the
+        // asset task, and AVFoundation auto-resumes the partial .movpkg).
         if let assetTask = assetTaskForRecord[id] {
             assetTask.suspend()
-            store.update(id: id) { $0.state = .paused }
+            store.update(id: id) { $0.state = .paused; $0.taskIdentifier = nil }
             return
         }
         #endif
         // A queued item has no live task yet: just mark it paused so it stops being eligible to start.
         guard let task = taskForRecord[id] else {
             if store.record(id: id)?.state == .queued {
-                store.update(id: id) { $0.state = .paused }
+                store.update(id: id) { $0.state = .paused; $0.taskIdentifier = nil }
             }
             return
         }
@@ -323,6 +325,9 @@ final class DownloadManager: NSObject, ObservableObject {
         task.taskDescription = record.id.uuidString
         assetTaskForRecord[record.id] = task
         recordForAssetTask[task.taskIdentifier] = record.id
+        // Persist the asset task's identifier so a relaunch can re-wire pause/cancel to the live task (the
+        // uuid in taskDescription still serves as the fallback match). Cosmetic field.
+        store.update(id: record.id) { $0.taskIdentifier = task.taskIdentifier }
         task.resume()
     }
 
@@ -361,6 +366,10 @@ final class DownloadManager: NSObject, ObservableObject {
     private func bind(task: URLSessionDownloadTask, to id: UUID) {
         taskForRecord[id] = task
         recordForTask[task.taskIdentifier] = id
+        // Persist the task identifier so a relaunch can map this still-running background task back to its
+        // record and re-wire pause/cancel. A cosmetic-only field, so a bare progress write is fine (do not
+        // force an index rewrite here beyond the store's default).
+        store.update(id: id) { $0.taskIdentifier = task.taskIdentifier }
     }
 
     private func clearTask(id: UUID) {
@@ -370,6 +379,9 @@ final class DownloadManager: NSObject, ObservableObject {
         }
         taskForRecord[id] = nil
         lastProgressPush[id] = nil   // do not leak the throttle entry across a terminal transition
+        // The record no longer has a live task; drop the persisted identifier so a later relaunch never
+        // tries to reconnect a task that is gone. No-op if the record was already removed (cancel).
+        if store.record(id: id) != nil { store.update(id: id) { $0.taskIdentifier = nil } }
         endForegroundAssertionIfIdle()
         // A slot just freed (finish / fail / pause / cancel): pull the next queued download in.
         startNextQueued()
@@ -406,14 +418,152 @@ final class DownloadManager: NSObject, ObservableObject {
     /// actually deliver in this relaunched process; the handler is then fired from `urlSessionDidFinishEvents`.
     func adoptBackgroundEvents(completionHandler: @escaping () -> Void) {
         backgroundCompletionHandler = completionHandler
-        _ = backgroundSession
+        // Also re-wire pause/cancel to any transfer still running: a background relaunch may hand us live
+        // tasks the in-memory maps know nothing about. reconnect materializes both sessions and rebuilds
+        // the maps (and is idempotent, so calling it here + at launch is safe).
+        reconnectInFlightDownloads()
+    }
+
+    /// Reconnect after an app relaunch so pause/cancel operate on the real, still-running transfers again.
+    ///
+    /// A `.background` URLSession (and an `AVAssetDownloadURLSession`) keeps its tasks RUNNING while the app
+    /// is killed, but the new process starts with EMPTY in-memory maps: `taskForRecord` / `recordForTask`
+    /// (byte downloads) and `assetTaskForRecord` / `recordForAssetTask` (HLS). Until we re-adopt those tasks,
+    /// a download shows as `.downloading` yet pause/cancel find no live task and silently no-op. So here we:
+    ///
+    ///  1. Re-CREATE each background session with its SAME identifier + delegate (a background session must be
+    ///     recreated in the new process to receive its running tasks) — done by touching the lazy sessions.
+    ///  2. `getAllTasks` and RECONCILE: map each live task back to its record (persisted `taskIdentifier`
+    ///     first, then the filename/uuid we serialized on `taskDescription`), so its pause/cancel controls
+    ///     drive the real task again. An ORPHAN task with no matching store record is cancelled. Any store
+    ///     record still marked `.downloading` with NO live task is reconciled to `.paused` (resumable) —
+    ///     never deleted, since its bytes-on-disk / partial asset are intact.
+    ///
+    /// Idempotent + fail-soft: safe to call at launch AND from the background-relaunch handler; a
+    /// reconnection miss reconciles to `.paused` rather than crashing or dropping a good download. No-op when
+    /// there are no in-flight records, so a normal launch pays nothing.
+    func reconnectInFlightDownloads() {
+        // Only in-flight (or seemingly-in-flight) records need reconnecting. Nothing to do otherwise, so an
+        // ordinary launch with no active downloads materializes no session and touches no state.
+        let inFlight = store.records.filter { $0.state == .downloading }
+        guard !inFlight.isEmpty else { return }
+
+        // (1) Force the lazy background byte-download session to materialize (recreates it in this process
+        // with the same identifier + delegate, so getAllTasks returns its running tasks).
+        let byteSession = backgroundSession
+        byteSession.getAllTasks { [weak self] tasks in
+            let downloadTasks = tasks.compactMap { $0 as? URLSessionDownloadTask }
+            Task { @MainActor [weak self] in
+                self?.reconcileByteTasks(downloadTasks)
+            }
+        }
+
         #if os(iOS)
-        // Re-materialize the HLS asset session on relaunch so it reattaches its delegate and delivers the
-        // completion events for a .movpkg that finished while the app was suspended; without this the record
-        // stays stuck on .downloading forever.
-        _ = hlsAssetSession
+        // (1) Same for the HLS asset session. Its live tasks are AVAssetDownloadTasks (a URLSessionTask but
+        // NOT a URLSessionDownloadTask), so they arrive via getAllTasks and are filtered on that type.
+        let assetSession = hlsAssetSession
+        assetSession.getAllTasks { [weak self] tasks in
+            let assetTasks = tasks.compactMap { $0 as? AVAssetDownloadTask }
+            Task { @MainActor [weak self] in
+                self?.reconcileAssetTasks(assetTasks)
+            }
+        }
         #endif
     }
+
+    /// (2) for byte downloads. Re-adopt each live task into the in-memory maps, then reconcile any record
+    /// that CLAIMS to be downloading but has no live task down to `.paused`.
+    private func reconcileByteTasks(_ tasks: [URLSessionDownloadTask]) {
+        var adopted = Set<UUID>()
+        for task in tasks {
+            guard let id = reconnectRecordID(for: task, filename: task.taskDescription) else {
+                // Orphan: a live task with no matching store record (record was deleted while suspended, or
+                // is a stale duplicate). Cancel it so it stops consuming bandwidth; nothing to reconcile.
+                task.cancel()
+                continue
+            }
+            // Re-wire both maps + the destination the off-main finish callback needs, exactly as bind()/
+            // startTask() would have. Do NOT call bind() (it re-persists taskIdentifier via a store write we
+            // already have); wire the maps directly.
+            taskForRecord[id] = task
+            recordForTask[task.taskIdentifier] = id
+            if let record = store.record(id: id) {
+                destinations.set(store.fileURL(for: record), for: task.taskIdentifier)
+                store.update(id: id) { $0.taskIdentifier = task.taskIdentifier }
+                beginForegroundAssertionIfNeeded(for: record)
+            }
+            adopted.insert(id)
+        }
+        reconcileStuckDownloading(excluding: adopted, hlsOnly: false)
+    }
+
+    #if os(iOS)
+    /// (2) for HLS asset downloads. Mirror of `reconcileByteTasks` for the asset session's live tasks.
+    private func reconcileAssetTasks(_ tasks: [AVAssetDownloadTask]) {
+        var adopted = Set<UUID>()
+        for task in tasks {
+            guard let id = reconnectAssetRecordID(for: task) else {
+                task.cancel()   // orphan asset task: no record to fill, discard its partial .movpkg
+                continue
+            }
+            assetTaskForRecord[id] = task
+            recordForAssetTask[task.taskIdentifier] = id
+            store.update(id: id) { $0.taskIdentifier = task.taskIdentifier }
+            adopted.insert(id)
+        }
+        reconcileStuckDownloading(excluding: adopted, hlsOnly: true)
+    }
+    #endif
+
+    /// Any record still marked `.downloading` after reconnection but with NO reconnected live task is
+    /// stranded (its session/task did not survive, e.g. a torrent foreground transfer whose server died
+    /// while suspended, or a task the OS dropped). Reconcile it to `.paused` so its controls make sense and
+    /// the user can resume — never delete it, the partial bytes / asset are still on disk. `hlsOnly` scopes
+    /// the sweep to the matching transport so the byte pass doesn't touch HLS records still awaiting the
+    /// asset-session callback and vice-versa.
+    private func reconcileStuckDownloading(excluding adopted: Set<UUID>, hlsOnly: Bool) {
+        for record in store.records where record.state == .downloading {
+            guard !adopted.contains(record.id) else { continue }
+            #if os(iOS)
+            let recordIsHLS = isHLSRecord(record)
+            #else
+            let recordIsHLS = false
+            #endif
+            if hlsOnly != recordIsHLS { continue }
+            // Still has a live task from THIS process (never lost) — leave it alone.
+            if taskForRecord[record.id] != nil { continue }
+            #if os(iOS)
+            if assetTaskForRecord[record.id] != nil { continue }
+            #endif
+            store.update(id: record.id) {
+                $0.state = .paused
+                $0.taskIdentifier = nil
+            }
+        }
+    }
+
+    /// Byte-download record id for a live task during reconnection: persisted `taskIdentifier` first (exact),
+    /// then the filename we serialized on `taskDescription` matched against `localFilename`. Both survive a
+    /// relaunch; the pair makes a stale identifier fall back to the filename rather than orphaning a task.
+    private func reconnectRecordID(for task: URLSessionTask, filename: String?) -> UUID? {
+        if let id = store.records.first(where: { $0.taskIdentifier == task.taskIdentifier && $0.state == .downloading })?.id {
+            return id
+        }
+        guard let filename else { return nil }
+        return store.records.first { $0.localFilename == filename && $0.state == .downloading }?.id
+    }
+
+    #if os(iOS)
+    /// HLS asset-download record id for a live task during reconnection: persisted `taskIdentifier` first,
+    /// then the record uuid we serialized on `taskDescription`.
+    private func reconnectAssetRecordID(for task: AVAssetDownloadTask) -> UUID? {
+        if let id = store.records.first(where: { $0.taskIdentifier == task.taskIdentifier && $0.state == .downloading })?.id {
+            return id
+        }
+        guard let desc = task.taskDescription, let id = UUID(uuidString: desc), store.record(id: id) != nil else { return nil }
+        return id
+    }
+    #endif
 
     /// Record id for a finished task, recovering across an app relaunch. The in-memory `recordForTask`
     /// is empty in the relaunched process, so fall back to matching the filename we persisted on the task

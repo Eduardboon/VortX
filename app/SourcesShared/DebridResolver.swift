@@ -277,6 +277,7 @@ actor TorBoxResolver: DebridResolving {
     /// timeout ~30s; uncached downloads surface as `.notReady` for the caller to fall back to the engine.
     private func pollByHash(_ hash: String, into torrentId: inout Int?) async throws -> [DebridFile] {
         for attempt in 0..<10 {
+            try Task.checkCancellation()   // a losing leg of the parallel cached-race (or the 15s bound) cancels the group: stop polling promptly, don't keep hitting the provider
             if attempt > 0 { try? await Task.sleep(nanoseconds: 3_000_000_000) }   // 3s between polls
             guard let url = URL(string: "\(Self.base)/mylist?bypass_cache=true") else { break }
             let env: Envelope<[Item]> = try await get(url)
@@ -997,6 +998,89 @@ extension DebridCoordinator {
             let first = await group.next() ?? nil
             group.cancelAll()
             return first
+        }
+    }
+
+    /// PARALLEL cached-source race for the AUTO-PICK play path: resolve up to the top `max` CACHED
+    /// candidates CONCURRENTLY and return the FIRST that produces a real link, cancelling the losers. This
+    /// is what makes "Watch Now" reach a genuinely-cached source fast instead of the user tapping dead rows
+    /// one by one: some candidates are truly cached (resolve in ~1 round trip) while others fail fast (the RD
+    /// not-cached fast-fail, a missing file, an expired link), so a small group settles in ~2-4s on the
+    /// winner rather than serially timing out the false-cached ones.
+    ///
+    /// Ordering IS the caller's ranking: `candidates` must arrive already StreamRanking-ordered (continuity /
+    /// binge / pin preserved), and the first `max` that are resolvable-cached are raced. A candidate is
+    /// resolvable-cached when it is a raw torrent whose lowercased infoHash is in `cachedHashes`, OR a usenet
+    /// stream whose nzb link is in `cachedUsenetURLs` — i.e. the same account-confirmed sets the source list
+    /// badges. A stream already carrying a direct `url` is skipped (nothing to resolve; the caller plays it
+    /// directly). Anything not confirmed cached is left out so we never kick off an uncached add-then-download.
+    ///
+    /// Each leg reuses `resolvedPlaybackRef` verbatim, so every per-leg guarantee holds: the existing 15s
+    /// bound, the RealDebrid active-download fast-fail, the season-pack file pick, and the fail-soft nil. The
+    /// whole group is therefore bounded by that same 15s per leg, and settles as soon as ONE leg wins.
+    ///
+    /// FAIL-SOFT: returns `nil` when nothing is confirmed-cached to race (e.g. no key, or no cached row) or
+    /// when every raced leg fails — the caller then falls back to today's single-resolve / local-engine path,
+    /// so behaviour with no debrid key is byte-identical (this returns `nil` before any `await`).
+    ///
+    /// - Parameters:
+    ///   - candidates: streams in the caller's rank order (continuity/binge/pin already applied).
+    ///   - episode: the SxEy target for a series season-pack pick. `nil` for movies.
+    ///   - cachedHashes: lowercased infoHashes the user's debrid account confirmed cached (`DebridCacheAwareness`).
+    ///   - cachedUsenetURLs: nzb links the user's TorBox usenet account confirmed cached (`DebridCacheAwareness`).
+    ///   - max: concurrency cap (<= 4 enforced) so we never hammer the provider; the losers are cancelled.
+    /// Returns the winning `ref` (URL + provider + reresolve ids, for the play-record) PAIRED with the source
+    /// `stream` it resolved from, so the caller can wire the engine / headers / quality signature off the
+    /// exact winning row (`DebridPlaybackRef` itself is a persisted value type and deliberately carries no
+    /// `CoreStream`).
+    func resolveFirstPlayable(candidates: [CoreStream], episode: DebridEpisode? = nil,
+                              cachedHashes: Set<String>, cachedUsenetURLs: Set<String> = [],
+                              max: Int = 4) async -> (ref: DebridPlaybackRef, stream: CoreStream)? {
+        // Zero-await no-key / nothing-to-race guarantee: with no resolver (or no confirmed-cached row) this
+        // returns nil before any provider contact, so the caller's fallback runs its unchanged path.
+        guard hasAnyResolver || hasUsenetResolver else { return nil }
+        guard !cachedHashes.isEmpty || !cachedUsenetURLs.isEmpty else { return nil }
+
+        // Keep only the confirmed-cached, resolvable candidates, in the caller's rank order. A raw torrent
+        // (url == nil) qualifies when its infoHash is in cachedHashes; a usenet stream (url == nil, nzbUrl set)
+        // qualifies when its nzb link is in cachedUsenetURLs. Everything else is dropped so we never start an
+        // uncached add-then-download in the race.
+        let cached = candidates.filter { s in
+            guard s.url == nil else { return false }
+            if let h = s.infoHash?.lowercased(), !h.isEmpty, cachedHashes.contains(h) { return true }
+            if let nzb = s.nzbUrl, !nzb.isEmpty, cachedUsenetURLs.contains(nzb) { return true }
+            return false
+        }
+        guard !cached.isEmpty else { return nil }
+
+        // Bound concurrency to <= 4 (and >= 1) so a group never hammers the provider with more than a handful
+        // of parallel resolves; the losers are cancelled the moment one wins.
+        let cap = Swift.min(Swift.max(max, 1), 4)
+        let racing = Array(cached.prefix(cap))
+        // A single confirmed-cached candidate is just the existing single resolve (no group overhead).
+        if racing.count == 1 {
+            guard let ref = await resolvedPlaybackRef(for: racing[0], episode: episode) else { return nil }
+            return (ref, racing[0])
+        }
+
+        return await withTaskGroup(of: (ref: DebridPlaybackRef, stream: CoreStream)?.self) { group in
+            for stream in racing {
+                group.addTask {
+                    // Each leg carries its own 15s bound + RD fast-fail (it is a full resolvedPlaybackRef).
+                    guard let ref = await DebridCoordinator.shared.resolvedPlaybackRef(for: stream, episode: episode)
+                    else { return nil }
+                    return (ref, stream)
+                }
+            }
+            // First leg to produce a real ref WINS. A leg that fails/fast-fails returns nil; keep draining
+            // until a non-nil ref appears or every leg has reported. Then cancel the remaining (in-flight)
+            // legs so we stop hitting the provider the instant we have a playable link.
+            var winner: (ref: DebridPlaybackRef, stream: CoreStream)?
+            for await result in group {
+                if let result { winner = result; break }
+            }
+            group.cancelAll()
+            return winner
         }
     }
 }
