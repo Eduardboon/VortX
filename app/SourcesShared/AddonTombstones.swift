@@ -50,6 +50,27 @@ enum AddonTombstones {
         return true
     }
 
+    /// Forget a removal tombstone, so an EXPLICIT fresh install of the same add-on later is honored
+    /// instead of being suppressed forever by an old removal. Called from `CoreBridge.installAddon` on a
+    /// successful install (the single hardened installer every UI routes through): an explicit user
+    /// install is intent to have the add-on, which supersedes a prior removal. Idempotent. Returns true
+    /// when a tombstone was actually cleared.
+    ///
+    /// Why this is safe against a stale-doc re-resurrection: `vortxSummary` rewrites `doc.vortx.addons`
+    /// from the live engine set (which now includes the re-installed add-on) and `doc.vortx.deletedAddons`
+    /// from THIS (now-cleared) local set on the next push, so the account doc stops carrying the tombstone.
+    /// A concurrently-authored web `doc.webAddonRemovals` for the same URL would re-tombstone on the next
+    /// syncDown, which is correct last-writer-wins: whichever action (install vs delete) synced later wins.
+    @discardableResult
+    static func forget(_ transportUrl: String) -> Bool {
+        let key = normalize(transportUrl)
+        guard !key.isEmpty else { return false }
+        var set = all()
+        guard set.remove(key) != nil else { return false }
+        UserDefaults.standard.set(Array(set), forKey: deletedKey)
+        return true
+    }
+
     /// Fold incoming tombstones (from another device's `doc.vortx.deletedAddons`, or a web-authored
     /// `doc.webAddonRemovals`) into the local set. Returns true when the set changed (so the caller can
     /// uninstall the now-tombstoned add-ons from the engine). The UNION means a tombstone propagates

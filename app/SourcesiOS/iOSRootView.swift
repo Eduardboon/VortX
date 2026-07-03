@@ -2545,26 +2545,28 @@ private typealias PlatformPosterImage = UIImage
 private typealias PlatformPosterImage = NSImage
 #endif
 
-/// In-memory decoded-poster cache on top of the shared URLCache (disk). Keyed by URL, evicted under
-/// memory pressure, so a poster shown in several rails decodes once.
-private let posterMemoryCacheiOS: NSCache<NSURL, PlatformPosterImage> = {
-    let c = NSCache<NSURL, PlatformPosterImage>(); c.countLimit = 400; return c
-}()
-
 /// Cached, self-retrying poster image for the iPhone / iPad / Mac rails and grids. Raw `AsyncImage` keeps
 /// no cache and CANCELS its request when a Lazy cell recycles on scroll, without retrying, which is exactly
-/// the on-device "some posters load, others stay blank" report. This loads via `.task(id:)` (re-runs on
-/// every reappear, instant on a cache hit), treats a cancel as not-a-failure so the next appear retries,
-/// and shows a film placeholder only on a real failure. Mirrors the tvOS PosterArt loader; the caller keeps
-/// its own frame / crop / clip so the 120x180 fill-crop framing (F37) is unchanged.
+/// the on-device "some posters load, others stay blank" report. This loads via the shared `PosterImageLoader`
+/// (dedicated large URLCache, bounded concurrency, OFF-MAIN ImageIO decode), re-runs on every reappear via
+/// `.task(id:)` (instant + synchronous on a decoded-cache hit, so a re-scrolled card never flashes blank),
+/// treats a cancel as not-a-failure so the next appear retries, and shows a film placeholder only on a real
+/// failure. The caller keeps its own frame / crop / clip so the fill-crop framing (F37) is unchanged.
 struct CachedPosterImage: View {
     let url: String?
-    @State private var image: PlatformPosterImage?
+    @State private var image: VXPosterImage?
     @State private var failed = false
+
+    /// Paint instantly (no task hop, no blank frame) when the decoded image is already in memory. The
+    /// `.task` still runs to load a cold poster; on a warm one it returns immediately.
+    private var synchronousCache: VXPosterImage? {
+        guard let raw = url, let u = URL(string: raw) else { return nil }
+        return PosterImageLoader.cached(u)
+    }
 
     var body: some View {
         Group {
-            if let image {
+            if let image = image ?? synchronousCache {
                 imageView(image).resizable().scaledToFill()
             } else if failed {
                 Theme.Palette.surface1.overlay(
@@ -2576,7 +2578,7 @@ struct CachedPosterImage: View {
         .task(id: url) { await load() }
     }
 
-    private func imageView(_ img: PlatformPosterImage) -> Image {
+    private func imageView(_ img: VXPosterImage) -> Image {
         #if canImport(UIKit)
         Image(uiImage: img)
         #else
@@ -2586,19 +2588,21 @@ struct CachedPosterImage: View {
 
     private func load() async {
         failed = false
-        guard let raw = url, !raw.isEmpty, let u = URL(string: raw) else { failed = true; return }
-        if let cached = posterMemoryCacheiOS.object(forKey: u as NSURL) { image = cached; return }
-        var req = URLRequest(url: u)
-        req.cachePolicy = .returnCacheDataElseLoad   // posters are immutable: prefer the shared disk cache
-        do {
-            let (data, _) = try await URLSession.shared.data(for: req)
-            guard !Task.isCancelled else { return }
-            if let img = PlatformPosterImage(data: data) {
-                posterMemoryCacheiOS.setObject(img, forKey: u as NSURL)
-                image = img
-            } else { failed = true }
-        } catch {
-            if !Task.isCancelled { failed = true }   // a cancel (scrolled away) is not a failure; the next appear retries
+        guard let raw = url, !raw.isEmpty else { failed = true; return }
+        if let img = await PosterImageLoader.load(raw) {
+            image = img
+            return
+        }
+        if Task.isCancelled { return }   // scroll-away: leave `failed` false so the recycled cell reloads
+        // One quick retry before latching the film placeholder, so a transient network blip on a card that
+        // stays on screen (not scrolled away) does not leave it permanently blank — the "posters lose their
+        // picture icon" report. Still bounded (a single retry) so a genuinely dead URL settles fast.
+        try? await Task.sleep(nanoseconds: 400_000_000)
+        if Task.isCancelled { return }
+        if let img = await PosterImageLoader.load(raw) {
+            image = img
+        } else if !Task.isCancelled {
+            failed = true
         }
     }
 }
@@ -2682,15 +2686,9 @@ private struct LandscapeArtiOS: View {
     }
 
     private func fetchImage(_ u: URL) async -> PlatformPosterImage? {
-        if let cached = posterMemoryCacheiOS.object(forKey: u as NSURL) { return cached }
-        var req = URLRequest(url: u)
-        req.cachePolicy = .returnCacheDataElseLoad   // immutable art: prefer the shared disk cache
-        do {
-            let (data, _) = try await URLSession.shared.data(for: req)
-            guard !Task.isCancelled, let img = PlatformPosterImage(data: data) else { return nil }
-            posterMemoryCacheiOS.setObject(img, forKey: u as NSURL)
-            return img
-        } catch { return nil }
+        // Shared loader: dedicated large URLCache, bounded concurrency, off-main ImageIO decode. Backdrops are
+        // wider than portrait posters, so allow a larger downsample ceiling to keep the 16:9 art crisp.
+        await PosterImageLoader.load(u.absoluteString, maxPixel: 1280)
     }
 }
 

@@ -202,7 +202,10 @@ final class LocalizedMetadataStore: ObservableObject {
             }
         }
         if !updates.isEmpty {
-            for (k, v) in updates { entries[k] = v }
+            // ONE mutation of the @Published dict, not 60. Assigning per key fired objectWillChange for every
+            // id, and since every on-screen PosterCardiOS observes this store, a single 60-id flush re-rendered
+            // the whole visible grid ~60 times. Merging once coalesces that into a single re-render.
+            entries.merge(updates) { _, new in new }
             saveDiskCache()
         }
         // If there is still a backlog, keep draining.
@@ -254,6 +257,7 @@ final class LocalizedMetadataStore: ObservableObject {
     private func backfillFromUserKey(ids: [String], lang: String) async {
         let capped = Array(ids.prefix(Self.maxBackfillPerFlush))
         var contributions: [[String: String]] = []
+        var backfilled: [String: LocalizedMeta] = [:]
         await withTaskGroup(of: (String, LocalizedMeta?).self) { group in
             for id in capped {
                 group.addTask { [weak self] in
@@ -262,13 +266,14 @@ final class LocalizedMetadataStore: ObservableObject {
             }
             for await (id, meta) in group {
                 guard let meta, !meta.isEmpty else { continue }
-                entries[scopedKey(id, lang: lang)] = meta
+                backfilled[scopedKey(id, lang: lang)] = meta   // collect, then merge once (single re-render)
                 contributions.append([
                     "id": id, "title": meta.title,
                     "posterPath": meta.posterPath, "logoPath": meta.logoPath,
                 ])
             }
         }
+        if !backfilled.isEmpty { entries.merge(backfilled) { _, new in new } }
         if !contributions.isEmpty {
             saveDiskCache()
             await contribute(items: contributions, lang: lang)

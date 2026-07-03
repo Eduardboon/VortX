@@ -1722,7 +1722,7 @@ struct CoreStreamList: View {
     /// skips `prepareTorrent` (no `/create`); the player keys torrent behaviour off the URL shape, so it
     /// treats this as a direct stream automatically (no warm-up, no `closeTorrent`).
     private func play(_ stream: CoreStream) {
-        Task { await playResolving(stream) }
+        Task { await playResolving(stream, explicit: true) }   // a tapped source row / quality pick: honor it in the player
     }
 
     /// AUTO-PICK play (the "Watch Now" button + resolution long-press): race the top few CACHED sources in
@@ -1752,17 +1752,20 @@ struct CoreStreamList: View {
                                                 headers: win.stream.requestHeaders)
             return
         }
-        // No parallel-cached winner: today's single-resolve path on the ranked best, unchanged.
-        await playResolving(best)
+        // No parallel-cached winner: today's single-resolve path on the ranked best, unchanged. This is an
+        // AUTO pick (the Watch-Now fallback), so it may hop normally on a start-timeout.
+        await playResolving(best, explicit: false)
     }
 
-    @MainActor private func playResolving(_ stream: CoreStream) async {
+    /// `explicit`: true when the user tapped this exact source row / quality (honor it in the player, no
+    /// silent hop on a start-timeout); false when it is the auto Watch-Now single-resolve fallback.
+    @MainActor private func playResolving(_ stream: CoreStream, explicit: Bool) async {
         if let direct = await DebridCoordinator.shared.resolvedPlaybackURL(for: stream) {
             core.loadEnginePlayer(for: stream)
             presenter.request = PlaybackRequest(url: direct, title: title, meta: meta, episodes: episodes,
                                                 sourceHint: StreamRanking.signature(stream), torrent: false,
                                                 bingeGroup: stream.behaviorHints?.bingeGroup,
-                                                headers: stream.requestHeaders)
+                                                headers: stream.requestHeaders, wasExplicitPick: explicit)
             return
         }
         // Today's path, unchanged.
@@ -1772,7 +1775,7 @@ struct CoreStreamList: View {
         presenter.request = PlaybackRequest(url: url, title: title, meta: meta, episodes: episodes,
                                             sourceHint: StreamRanking.signature(stream), torrent: stream.isTorrent,
                                             bingeGroup: stream.behaviorHints?.bingeGroup,
-                                            headers: stream.requestHeaders)
+                                            headers: stream.requestHeaders, wasExplicitPick: explicit)
     }
 
     private func filterBar(_ groups: [CoreStreamSourceGroup], total: Int) -> some View {

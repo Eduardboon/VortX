@@ -35,6 +35,10 @@ struct PlaybackRequest: Identifiable {
     /// yt-direct adaptive pair (trailers / pasted YouTube links): the separate AUDIO stream mpv mounts
     /// alongside the video-only `url` (`--audio-files`). Forces the libmpv engine in TVPlayerView.
     var audioSidecarURL: URL? = nil
+    /// True when the user explicitly chose this exact source (a tapped source-list row / quality pick),
+    /// false for an auto-pick (Watch Now / a Continue-Watching resume). TVPlayerView honors an explicit
+    /// pick on a start-timeout (retries in place) instead of silently hopping to a lower-quality source.
+    var wasExplicitPick: Bool = false
 }
 
 /// Holds the active playback request. Set it to present the player; clear it to dismiss.
@@ -84,7 +88,7 @@ struct RootView: View {
                 TVPlayerView(url: req.url, title: req.title, meta: req.meta, episodes: req.episodes,
                              sourceHint: req.sourceHint, torrent: req.torrent, bingeGroup: req.bingeGroup,
                              headers: req.headers, forceMPV: req.forceMPV, isTrailer: req.isTrailer,
-                             audioSidecarURL: req.audioSidecarURL,
+                             audioSidecarURL: req.audioSidecarURL, startedFromExplicitPick: req.wasExplicitPick,
                              onClose: { presenter.request = nil })
                     .id(req.id)   // clean player teardown per request
             }

@@ -284,20 +284,21 @@ final class SourceIndexServeSource: ObservableObject {
         }
     }
 
-    /// Merge the community sources into `groups` as one extra group, deduped against streams already present (by
-    /// infoHash). Returns `groups` unchanged when there is nothing to add -- a pure pass-through when SERVE is
-    /// off or the pool had nothing new.
+    /// Merge the community sources into `groups` as its OWN named source group, exactly like any other add-on.
+    /// Singularity's corroborated sources appear under the "Singularity" label whenever the pool has any for this
+    /// title, EVEN when one of your own add-ons also returns the same release: add-ons are never deduped against
+    /// one another, so Singularity is not either (that is what made it invisible on titles your add-ons already
+    /// cover). We drop only internal duplicates within Singularity's own list, by infoHash. Empty pool (SERVE off
+    /// / not signed in / fleet-off / nothing corroborated) is a pure pass-through, so the list is unchanged.
     func merged(into groups: [CoreStreamSourceGroup]) -> [CoreStreamSourceGroup] {
         guard !streams.isEmpty else { return groups }
-        var seenHashes: Set<String> = []
-        for group in groups {
-            for s in group.streams { if let h = s.infoHash?.lowercased() { seenHashes.insert(h) } }
+        var seen: Set<String> = []
+        var own: [CoreStream] = []
+        for s in streams {
+            guard let h = s.infoHash?.lowercased() else { continue }
+            if seen.insert(h).inserted { own.append(s) }
         }
-        let fresh = streams.filter { s in
-            guard let h = s.infoHash?.lowercased() else { return false }
-            return !seenHashes.contains(h)
-        }
-        guard !fresh.isEmpty else { return groups }
-        return groups + [CoreStreamSourceGroup(id: "vortx.singularity.sources", addon: "Community", streams: fresh)]
+        guard !own.isEmpty else { return groups }
+        return groups + [CoreStreamSourceGroup(id: "vortx.singularity.sources", addon: "Singularity", streams: own)]
     }
 }

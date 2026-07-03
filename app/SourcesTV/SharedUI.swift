@@ -31,9 +31,16 @@ struct PosterArt: View {
     @State private var failed = false
     init(_ poster: String?, width: CGFloat = kPosterWidth) { self.poster = poster; self.width = width }
 
+    /// Paint instantly (no task hop, no blank frame) when the decoded image is already in memory, mirroring the
+    /// iOS `CachedPosterImage`. The `.task` still runs to load a cold poster; on a warm one it returns at once.
+    private var synchronousCache: UIImage? {
+        guard let raw = poster, let u = URL(string: raw) else { return nil }
+        return PosterImageLoader.cached(u)
+    }
+
     var body: some View {
         Group {
-            if let image {
+            if let image = image ?? synchronousCache {
                 Image(uiImage: image).resizable().aspectRatio(contentMode: .fill)
             } else if failed {
                 Theme.Palette.surface2.overlay(
@@ -49,19 +56,23 @@ struct PosterArt: View {
     }
 
     private func load() async {
-        guard let raw = poster, let url = URL(string: raw) else { failed = true; return }   // no poster → film placeholder
-        if let cached = posterMemoryCache.object(forKey: url as NSURL) { image = cached; return }   // instant, no flash
-        var req = URLRequest(url: url)
-        req.cachePolicy = .returnCacheDataElseLoad   // posters are immutable: prefer the shared disk cache
-        do {
-            let (data, _) = try await URLSession.shared.data(for: req)
-            guard !Task.isCancelled else { return }
-            if let img = UIImage(data: data) {
-                posterMemoryCache.setObject(img, forKey: url as NSURL)
-                image = img
-            } else { failed = true }
-        } catch {
-            if !Task.isCancelled { failed = true }   // a cancel (scrolled away) is not a failure; the next appear retries
+        guard let raw = poster, !raw.isEmpty else { failed = true; return }   // no poster → film placeholder
+        // Shared loader: dedicated large URLCache, bounded concurrency, OFF-MAIN ImageIO decode. Same fix as
+        // iOS/Mac (posters were re-fetching through a tiny shared cache and decoding on the main thread).
+        if let img = await PosterImageLoader.load(raw) {
+            image = img
+            return
+        }
+        if Task.isCancelled { return }   // scroll-away: leave `failed` false so the recycled cell reloads
+        // One quick retry before latching the film placeholder, mirroring the iOS `CachedPosterImage`, so a
+        // transient network blip on a card that stays on screen (not scrolled away) does not leave it
+        // permanently blank. Still bounded (a single retry) so a genuinely dead URL settles fast.
+        try? await Task.sleep(nanoseconds: 400_000_000)
+        if Task.isCancelled { return }
+        if let img = await PosterImageLoader.load(raw) {
+            image = img
+        } else if !Task.isCancelled {
+            failed = true   // a real failure shows the film placeholder; a scroll-away cancel retries next appear
         }
     }
 }

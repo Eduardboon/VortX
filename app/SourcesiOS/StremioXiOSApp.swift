@@ -44,6 +44,10 @@ struct StremioXiOSApp: App {
             Task.detached(priority: .utility) { await StremioServer.applyServerConfig() }
         }
         #endif
+        // Install the dedicated, large image URLCache BEFORE any poster loads. The default shared cache is
+        // far too small to hold a catalog page of posters, which was the root of the "half the posters stay
+        // blank + the app is laggy on open" report (constant re-fetch through the tiny shared cache).
+        PosterImageLoader.configureSharedCache()
         // Safety sweep: clear any leftover libmpv on-disk streaming cache from a previous run. The
         // player wipes it on a genuine exit, but a crash mid-playback could leave bytes behind — this
         // guarantees a fresh, bounded start so the configurable cache can never accumulate unbounded.

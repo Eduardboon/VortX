@@ -47,6 +47,12 @@ struct PlayerScreen: View {
     var recordIsTorrent: Bool = false                       // stream rides the embedded torrent engine
     var recordDebridRef: DebridPlaybackRef? = nil           // native-debrid provenance, for CW reresolve of an expired link
     var isTrailer: Bool = false                             // a trailer preview: always plays in-app, never auto-routes external
+    /// True when the LAUNCH source was an explicit user choice (a tapped source-list row / quality pick),
+    /// false for an auto-pick (Watch Now / a Continue-Watching resume). An explicit pick is HONORED on a
+    /// start-timeout: the player retries the SAME source with a longer first-buffer grace rather than
+    /// silently hopping to a different, often lower-quality, source (the "picked 4K, got 480p" report).
+    /// Only the auto path may auto-hop. Threaded from the presenter's PlayerLaunch; defaults to auto.
+    var startedFromExplicitPick: Bool = false
     /// yt-direct adaptive pair (trailers): the separate AUDIO stream mpv mounts alongside the video-only
     /// `url` (`--audio-files`). Forces the libmpv engine (AVPlayer can't merge a second remote file).
     var audioSidecarURL: URL? = nil
@@ -345,6 +351,17 @@ struct PlayerScreen: View {
     @State private var exhaustedURLs: Set<URL> = []
     @State private var sourceHops = 0
     private let maxSourceHops = 4
+    // Whether the CURRENTLY loading source was explicitly chosen by the user (seeded from
+    // `startedFromExplicitPick`, updated on every in-player source/quality pick and auto-hop). An
+    // explicit pick is retried in place on a start-timeout instead of hopping to a different source.
+    @State private var currentPickWasExplicit = false
+    // First-buffer grace for a big 4K remux on slow debrid: a start-timeout that fires while bytes are
+    // still arriving (the demuxer-cache edge advanced since the last watchdog arm) extends the wait
+    // rather than declaring the source dead. Bounded by the number of extensions and the overall
+    // recovery deadline, so a genuinely stalled source still errors.
+    @State private var lastBufferedAtWatchdog = -1.0
+    @State private var bufferGraceUsed = 0
+    private let maxBufferGraceExtensions = 3      // up to ~3×20s extra on top of the 30s watchdog, deadline-capped
     @State private var recoveryDeadline: Task<Void, Never>?
     private let maxRecoverySeconds: Double = 150
     // Mid-playback stall recovery: a watchdog reloads / hops when the position freezes while NOT
@@ -556,6 +573,7 @@ struct PlayerScreen: View {
             }
             #endif
             curURL = url; curHeaders = headers; curIsTorrent = recordIsTorrent
+            currentPickWasExplicit = startedFromExplicitPick   // honor an explicit launch pick on the first start-timeout
             #if os(iOS) || os(macOS)
             if engineLatch == nil { engineLatch = routedToAVPlayer }   // engine picked ONCE per playback
             #endif
@@ -990,14 +1008,36 @@ struct PlayerScreen: View {
             NSLog("[tp-cap] %@ capture at %.0fs never serviced (VO idle) - releasing guard", engine, time)
         }
         player.captureFrameJPEGData(maxWidth: 480) { data in
-            watchdog.cancel()
-            self.localTrickplayCaptureInFlight = false
+            // MAIN-ACTOR HOP (the owner-device zero-contribution fix): the libmpv engine calls this completion
+            // on its background capture queue (MPVMetalViewController.captureQueue / a Metal completion thread),
+            // NOT the main thread - only the AVPlayer engine hops to main itself. On the owner's primary engine
+            // (Mac 4K/HDR/DV + iOS libmpv) this closure therefore ran OFF the main actor, so the @MainActor
+            // `localTrickplayCaptureInFlight` reset and `recordCapturedFrameData` (which appends to sessionFrames
+            // and fires the community upload) executed on a background thread against main-actor state -> the
+            // in-flight guard could wedge and the community frames never reliably accumulated, so the pool got
+            // ZERO rows from libmpv plays even though the LOCAL disk cache (its own ioQueue) still worked. Hop to
+            // the main actor here so BOTH engines feed record+upload identically. `data` (Data) is Sendable.
+            //
+            // The heavy JPEG decode + macOS near-black rasterization/sampling runs HERE, off the main actor (this
+            // libmpv completion is on a background capture queue; the AVPlayer engine already hops to main before
+            // calling back, so its decode is on main, which is unavoidable and cheap for that path). Only the small
+            // main-actor tail (in-flight reset + record/upload of the already-decoded frame) hops to the main actor.
             guard let data else {
-                NSLog("[tp-cap] %@ captureFrameJPEGData returned NIL at %.0fs (no video output / protected / not-ready)", engine, time)
+                Task { @MainActor in
+                    watchdog.cancel()
+                    self.localTrickplayCaptureInFlight = false
+                    NSLog("[tp-cap] %@ captureFrameJPEGData returned NIL at %.0fs (no video output / protected / not-ready)", engine, time)
+                }
                 return
             }
             NSLog("[tp-cap] %@ captured %d bytes at %.0fs", engine, data.count, time)
-            self.scrubThumbnails.recordCapturedFrameData(data, at: time)
+            let decoded = ScrubThumbnailsStore.decodeCapturedFrame(data, at: time)   // heavy decode + black-check OFF main
+            Task { @MainActor in
+                watchdog.cancel()
+                self.localTrickplayCaptureInFlight = false
+                guard let decoded else { return }   // decode failed / near-black: already logged off-actor
+                self.scrubThumbnails.recordDecodedFrame(decoded, data: data, at: time)
+            }
         }
     }
 
@@ -1188,6 +1228,14 @@ struct PlayerScreen: View {
         }
         guard autoRetryCount < maxAutoRetries else {
             reconnecting = false
+            // Honor an explicit user pick: a hard failure after the in-place retries surfaces a clear
+            // "choose another source" error instead of silently hopping to a different (often lower-quality)
+            // source. Only the auto path (Watch Now / resume) falls through to the failover hop below.
+            if currentPickWasExplicit {
+                if loadErrorMsg.isEmpty { loadErrorMsg = "This source didn't load. Choose another source." }
+                withAnimation { loadFailed = true }
+                return
+            }
             if hopToNextSource(reason: "load failed") { return }
             // CW-resume of a debrid/direct stream whose stored link expired (debrid URLs are time-limited):
             // iOSDirectResume kicks off a background reload of the title's streams, but they may not have
@@ -1238,9 +1286,13 @@ struct PlayerScreen: View {
             // `recoveryDeadline` non-nil, so without this `startRecoveryDeadline`'s idempotency guard would
             // skip arming and the fresh attempt would spin uncapped. Mirrors the reset on a deliberate pick.
             recoveryDeadline?.cancel(); recoveryDeadline = nil
+            // Refresh the first-buffer grace budget too, so a manual retry after an exhausted explicit pick
+            // gets its full extend/retry grace back (not a single no-grace 30s attempt).
+            bufferGraceUsed = 0; lastBufferedAtWatchdog = -1
         }
         autoRetryTask?.cancel()
         withAnimation { loadFailed = false }
+        bufferedTime = 0   // reload: clear the buffered-ahead band so the buffer-grace watchdog re-baselines against the new fill, not the previous source's edge
         buffering = true; hasStartedPlaying = false; isSeekable = true; appliedSize = false; loadErrorMsg = ""
         loadIntoPlayer(curURL ?? url, headers: curHeaders, live: isLive)
         startLoadTimeout()
@@ -1250,17 +1302,65 @@ struct PlayerScreen: View {
     private func startLoadTimeout() {
         loadTimeout?.cancel()
         startRecoveryDeadline()   // arms the overall pre-start cap once; later hops leave it running
+        lastBufferedAtWatchdog = bufferedTime   // snapshot the buffered edge so the fire path can tell if bytes moved
         loadTimeout = Task { @MainActor in
             try? await Task.sleep(for: .seconds(30))
             guard !hasStartedPlaying, !loadFailed else { return }
-            // THE HANG: a cold torrent never emits an end-file error (mpv reconnect=1 keeps retrying the
-            // peerless loopback URL), so it would buffer forever with no recovery. Warm it up instead of
-            // hopping/failing. Non-torrents time out to a hop/error as before.
-            if curIsTorrent { warmUpTorrent(); return }
-            if hopToNextSource(reason: "load timeout") { return }
-            if loadErrorMsg.isEmpty { loadErrorMsg = "Timed out, the source never started." }
-            withAnimation { loadFailed = true }
+            handleStartTimeout()
         }
+    }
+
+    /// The 30s start-watchdog fired without playback beginning. Decide between EXTEND (bytes still
+    /// arriving on a slow big source), WARM (a cold torrent), HONOR (retry an explicit pick in place), or
+    /// HOP (the auto path), preserving every existing recovery path:
+    ///  - A cold torrent still warms up (mpv never errors a peerless torrent).
+    ///  - A big 4K first-buffer that is genuinely progressing (the demuxer-cache edge advanced since the
+    ///    watchdog armed) EXTENDS instead of hopping, bounded by `maxBufferGraceExtensions` and the
+    ///    overall recovery deadline, so a 4K remux on slow debrid isn't declared dead mid-fill.
+    ///  - An EXPLICIT pick (a user-chosen source/quality) is retried IN PLACE, never silently swapped for
+    ///    a different lower-quality source; once its grace is spent it surfaces a clear "not ready" error
+    ///    with the source list, rather than dropping to a 480p different source.
+    ///  - Only the AUTO path (Watch Now / resume) hops to another source.
+    private func handleStartTimeout() {
+        // THE HANG: a cold torrent never emits an end-file error (mpv reconnect=1 keeps retrying the
+        // peerless loopback URL), so it would buffer forever with no recovery. Warm it up instead of
+        // hopping/failing.
+        if curIsTorrent { warmUpTorrent(); return }
+        // Bytes still arriving on a slow (typically 4K remux) first-buffer: extend rather than give up.
+        if bufferGraceUsed < maxBufferGraceExtensions, bufferedTime > lastBufferedAtWatchdog + 0.25 {
+            bufferGraceUsed += 1
+            reconnectMsg = "Buffering… this source is large"
+            withAnimation { reconnecting = true }
+            buffering = true
+            lastBufferedAtWatchdog = bufferedTime
+            loadTimeout?.cancel()
+            loadTimeout = Task { @MainActor in
+                try? await Task.sleep(for: .seconds(20))
+                guard !hasStartedPlaying, !loadFailed else { return }
+                handleStartTimeout()
+            }
+            return
+        }
+        // Honor an explicit user pick: retry the SAME source in place (a longer grace) instead of hopping
+        // to a different, possibly lower-quality, source. Once the grace is spent, surface a clear error
+        // that points at the source list, not a silent quality drop.
+        if currentPickWasExplicit {
+            if bufferGraceUsed < maxBufferGraceExtensions {
+                bufferGraceUsed += 1
+                reconnectMsg = "Still starting this source…"
+                withAnimation { reconnecting = true }
+                retryLoad(resetAutoRetries: false)
+                return
+            }
+            reconnecting = false
+            if loadErrorMsg.isEmpty { loadErrorMsg = "This source isn't ready (still downloading on your debrid, or slow). Choose another source." }
+            withAnimation { loadFailed = true }
+            return
+        }
+        // Auto path (Watch Now / resume): hop to the next-best untried source (quality-drop-capped inside).
+        if hopToNextSource(reason: "load timeout") { return }
+        if loadErrorMsg.isEmpty { loadErrorMsg = "Timed out, the source never started." }
+        withAnimation { loadFailed = true }
     }
 
     /// Warm a cold torrent before handing back to mpv: poll the embedded server's stats.json for peer
@@ -1429,12 +1529,30 @@ struct PlayerScreen: View {
 
     /// The best playable stream not yet tried for this title / episode, honouring the user's source
     /// ordering + continuity / binge hints + any pin. Returns nil when nothing untried remains.
+    ///
+    /// QUALITY-DROP CAP (auto path): an automatic failover must never plunge more than one resolution
+    /// tier below the best CACHED option that exists (the "picked/expected 4K, silently got 480p"
+    /// report). We first try to pick from candidates within one tier of the best cached resolution; only
+    /// if that leaves nothing untried do we fall back to the unfiltered ranking, so a title whose only
+    /// remaining sources are low-res still plays the best it has rather than dead-ending.
     private func nextUntriedStream() -> CoreStream? {
         let remaining = currentSourceGroups.map { group in
             CoreStreamSourceGroup(id: group.id, addon: group.addon, streams: group.streams.filter { s in
                 guard let u = s.playableURL else { return false }
                 return u != curURL && !exhaustedURLs.contains(u)
             })
+        }
+        let cachedRes = StreamRanking.bestCachedResolution(remaining)
+        if cachedRes > 0 {
+            let floorStep = StreamRanking.resolutionTierStep(cachedRes) - 1
+            let capped = remaining.map { group in
+                CoreStreamSourceGroup(id: group.id, addon: group.addon, streams: group.streams.filter { s in
+                    StreamRanking.resolutionTierStep(StreamRanking.resolutionRank(s)) >= floorStep
+                })
+            }
+            if let hit = StreamRanking.best(capped, continuity: recordQualityText, binge: nil, pin: sourcePin) {
+                return hit
+            }
         }
         return StreamRanking.best(remaining, continuity: recordQualityText, binge: nil, pin: sourcePin)
     }
@@ -1475,12 +1593,17 @@ struct PlayerScreen: View {
         curURL = newURL
         curHeaders = stream.requestHeaders
         curIsTorrent = stream.isTorrent
+        // A manual pick makes THIS source explicit (honor it on a start-timeout); an automatic hop makes
+        // the new source non-explicit so it can hop onward normally.
+        currentPickWasExplicit = userInitiated
+        bufferGraceUsed = 0; lastBufferedAtWatchdog = -1   // fresh source: its own first-buffer grace budget
+        bufferedTime = 0   // fresh source: clear the buffered-ahead band so the buffer-grace watchdog re-baselines against the new fill, not the previous source's edge
         if userInitiated {
             sourceHops = 0; exhaustedURLs = []
             recoveryDeadline?.cancel(); recoveryDeadline = nil
             stallRecoveries = 0
         }
-        if resumeOverride != nil { currentTime = 0; duration = 0; bufferedTime = 0 }   // episode switch: brand-new media, reset the clock + buffered band
+        if resumeOverride != nil { currentTime = 0; duration = 0 }   // episode switch: brand-new media, reset the clock (buffered band already cleared above)
         // Re-key trickplay for the new source/episode and reset the local-capture throttle: otherwise the
         // new stream's capture stays gated by the PREVIOUS stream's lastLocalTrickplayCapture, so episodes
         // 2..N of a session captured nothing. configureCommunity is idempotent and re-keys on the new title.
@@ -2525,7 +2648,11 @@ struct PlayerScreen: View {
         guard key != pooledSubsKey else { return }
         pooledSubsKey = key
         Task { @MainActor in
-            let result = await SubtitlePoolClient.fetchPooled(contentKey: contentKey, lang: nil, fingerprint: fp)
+            // SERVE moat gate: the pooled-subtitle READ is login-only on the worker (no VortX sign-in -> empty
+            // list, the pool "shows nothing" bug). Thread the real account flag like SourceIndexClient does, so a
+            // signed-in device stamps X-VX-Moat and the worker serves the pool.
+            let result = await SubtitlePoolClient.fetchPooled(contentKey: contentKey, lang: nil, fingerprint: fp,
+                                                              isSignedIn: VortXSyncManager.shared.isSignedIn)
             guard communityContentKey == contentKey else { return }   // title changed mid-fetch
             pooledSubs = result.subs
             // P3 seed: apply the community-learned offset ONCE (seconds). Works on BOTH engines now: libmpv
@@ -2550,7 +2677,8 @@ struct PlayerScreen: View {
         subtitleLoadingURL = marker
         if panel == .subtitles { panelRows = rows(for: .subtitles) }
         Task { @MainActor in
-            guard let localURL = await SubtitlePoolClient.download(sub) else {
+            // The pool-hosted sub TEXT is moat-gated too, so pass the same account flag the fetch used.
+            guard let localURL = await SubtitlePoolClient.download(sub, isSignedIn: VortXSyncManager.shared.isSignedIn) else {
                 subtitleLoadingURL = nil; subtitleLoadFailed = true
                 if panel == .subtitles { panelRows = rows(for: .subtitles) }
                 return

@@ -177,19 +177,47 @@ final class ScrubThumbnailsStore: ObservableObject {
         image = nil
     }
 
-    /// Stores a captured frame for future scrub previews.
-    func recordCapturedFrameData(_ data: Data, at time: Double) {
-        guard let key = localCacheKey, !key.isEmpty else { return }
+    /// Heavy frame processing (JPEG decode + macOS near-black rasterization/sampling), kept OFF the main
+    /// actor. `nonisolated` + `static` so a background capture-queue caller can run it before hopping to the
+    /// main actor: previously this decode + the macOS cgImage rasterization + the isBlackImage pixel sample all
+    /// ran on @MainActor (the capture completion hops to main before touching store state), so every ~10s a 4K
+    /// JPEG was decoded on the UI thread, contributing to jank. Returns the decoded image, or nil when the JPEG
+    /// failed to decode or the frame is near-black (unrendered) and should be dropped. Fail-soft: logs the drop.
+    nonisolated static func decodeCapturedFrame(_ data: Data, at time: Double) -> ScrubImage? {
         guard let decoded = ScrubImage(data: data) else {
             NSLog("[trickplay] dropping frame at %.0fs: JPEG decode failed", time)
-            return
+            return nil
         }
         #if canImport(AppKit)
+        // macOS-only unrendered-frame guard. This USED to silently drop the frame with no log, which made it a
+        // prime suspect for the owner-device zero-contribution bug: a libmpv 4K/HDR/DV frame can JPEG-decode to a
+        // CGImage that is NOT plain 8-bit/32-bpp (wide-gamut / 16-bit-per-component), and the old sampler hardcoded
+        // an 8-bit RGBA byte layout (x*4 striding, <30 thresholds), so it could read garbage and wrongly flag EVERY
+        // real frame as black - dropping them all before sessionFrames.append, with zero trace. isBlackImage is now
+        // format-guarded (only samples a safe 8-bit/32-bpp buffer; any other layout is treated as NOT black so a
+        // valid frame is never discarded on a format we can't sample), and the drop is logged so it is traceable.
         if let cgImage = decoded.cgImage(forProposedRect: nil, context: nil, hints: nil),
-           Self.isBlackImage(cgImage) {
-            return
+           isBlackImage(cgImage) {
+            NSLog("[trickplay] dropping frame at %.0fs: near-black (unrendered)", time)
+            return nil
         }
         #endif
+        return decoded
+    }
+
+    /// Stores a captured frame for future scrub previews. Convenience path that decodes on the CURRENT actor
+    /// (the caller's context) then records; the player capture path instead calls `decodeCapturedFrame` off the
+    /// main actor and `recordDecodedFrame` on it, to keep the heavy decode off the UI thread.
+    func recordCapturedFrameData(_ data: Data, at time: Double) {
+        guard let decoded = Self.decodeCapturedFrame(data, at: time) else { return }
+        recordDecodedFrame(decoded, data: data, at: time)
+    }
+
+    /// Light main-actor state mutations for an already-decoded (and black-checked) frame: cache the tile and
+    /// buffer the raw JPEG for a possible community upload. Keep the heavy decode/black-check in
+    /// `decodeCapturedFrame` so only this small tail touches @MainActor state.
+    func recordDecodedFrame(_ decoded: ScrubImage, data: Data, at time: Double) {
+        guard let key = localCacheKey, !key.isEmpty else { return }
         Self.localFrameCache.store(image: decoded, data: data, for: key, time: time)
         // Keep the raw JPEG for a possible community upload (bounded; the worker caps at 600 tiles anyway).
         // Buffer EVEN when a community set already exists, so a fuller local capture can improve a thin one.
@@ -252,9 +280,20 @@ final class ScrubThumbnailsStore: ObservableObject {
     }
 
     /// Samples five points; considers the frame black (unrendered) if four or more are near-black.
+    ///
+    /// FORMAT-GUARDED: the raw byte sampler below is only valid for a plain 8-bit, 32-bits-per-pixel buffer
+    /// (RGBA/BGRA - the first three channels are colour on both, so a <30 test on bytes [off..off+2] holds).
+    /// A libmpv 4K/HDR/DV capture can JPEG-decode to a 16-bit-per-component or otherwise non-32bpp CGImage; for
+    /// those the byte striding + <30 threshold are meaningless and previously flagged EVERY frame as black,
+    /// silently discarding all community frames on the owner's Mac. So anything that is not a safe 8-bit/32bpp
+    /// buffer returns false (NOT black) - never discard a real frame on a layout we cannot sample.
     #if canImport(AppKit)
-    private static func isBlackImage(_ cgImage: CGImage) -> Bool {
-        guard cgImage.width > 0, cgImage.height > 0 else { return true }
+    // nonisolated: pure pixel sampling with no main-actor state, so the nonisolated `decodeCapturedFrame`
+    // (run off the main thread on the capture queue) can call it without an actor hop.
+    nonisolated private static func isBlackImage(_ cgImage: CGImage) -> Bool {
+        guard cgImage.width > 0, cgImage.height > 0 else { return false }
+        // Only trust the raw sampler on a plain 8-bit, 4-byte-per-pixel image. Bail (not-black) otherwise.
+        guard cgImage.bitsPerComponent == 8, cgImage.bitsPerPixel == 32 else { return false }
         let w = cgImage.width, h = cgImage.height
         guard let data = cgImage.dataProvider?.data else { return false }
         let bytes = CFDataGetBytePtr(data)

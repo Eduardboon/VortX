@@ -673,6 +673,50 @@ enum StreamRanking {
             .sorted { score($0.stream) > score($1.stream) }
     }
 
+    /// The stream's resolution as a comparable tier number (4000 / 2160 / 1080 / 720 / …), the same
+    /// scale `resolution(_:)` scores on, exposed so the player's auto-failover can compare how far a
+    /// candidate would drop below the best cached option and refuse a >1-tier quality plunge (the
+    /// "picked 4K, got 480p" report). Reads only the parsed quality text, so it is add-on-agnostic.
+    static func resolutionRank(_ s: CoreStream) -> Int { resolution(qualityText(s)) }
+
+    /// Whether a source plays instantly (debrid-cached / direct), the convenience form of `isCached`
+    /// that parses the quality text for the caller. Used by the player's failover to prefer a cached
+    /// source over an uncached one when hopping automatically.
+    static func isCachedSource(_ s: CoreStream, debridCachedHashes: Set<String> = []) -> Bool {
+        isCached(s, qualityText(s), debridCachedHashes: debridCachedHashes)
+    }
+
+    /// The resolution tier of the best CACHED (instant) playable source across the loaded groups, or 0
+    /// when nothing cached is loaded yet. The auto-failover uses this as the ceiling reference so it
+    /// never hops down more than one tier below a genuinely-cached higher-quality option that exists.
+    static func bestCachedResolution(_ groups: [CoreStreamSourceGroup],
+                                     debridCachedHashes: Set<String> = []) -> Int {
+        var best = 0
+        for group in groups {
+            for s in group.streams where s.playableURL != nil && !s.isYouTubeTrailer {
+                guard isCached(s, qualityText(s), debridCachedHashes: debridCachedHashes) else { continue }
+                best = max(best, resolution(qualityText(s)))
+            }
+        }
+        return best
+    }
+
+    /// The coarse resolution TIER for the one-tier-drop cap: adjacent labelled tiers are one step apart
+    /// (4K → 1080p → 720p → 480p → lower), so a hop that lands more than one step below the best cached
+    /// option is the silent quality plunge we refuse on the auto path. Unknown/low resolutions collapse
+    /// into the bottom step, so a bare-tag source is treated as low, not promoted.
+    static func resolutionTierStep(_ res: Int) -> Int {
+        switch res {
+        case 4000...: return 4
+        case 2160...: return 4
+        case 1440...: return 3
+        case 1080...: return 3
+        case 720...:  return 2
+        case 480...:  return 1
+        default:      return 0
+        }
+    }
+
     /// Distinct choices for the visible quality picker: the best stream per resolution-and-flavor
     /// combination, labeled the way people actually choose ("4K · Dolby Vision · Remux",
     /// "1080p · BluRay · Atmos"). Best-first, so the top option is what Watch Now would play.

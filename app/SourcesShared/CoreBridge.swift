@@ -29,6 +29,13 @@ final class CoreBridge: ObservableObject {
     /// to the engine for UninstallAddon (which takes the whole descriptor, not just a URL).
     private var rawAddonsByUrl: [String: [String: Any]] = [:]
     private var started = false
+    /// Coalesces the Home-board rebuild. The engine emits a BURST of `board` events during launch and while a
+    /// catalog page lands (one per catalog settling), and each event used to trigger a full `buildBoardRows()`
+    /// JSON decode + a `boardRows` republish + a hero reseed, which was a real main-thread stall on open. This
+    /// timer collapses a burst into a single trailing rebuild ~80 ms after the last event, so the board still
+    /// updates but only once per burst. Touched only on the main actor.
+    private var boardRebuildWork: DispatchWorkItem?
+    private static let boardRebuildDebounce: TimeInterval = 0.08
     /// True while we're seeding the engine from the old app's authKey and waiting for the user fetch.
     private var awaitingAuthMigration = false
     /// Set while a profile account switch is in flight: the uid we're leaving (nil = was signed out).
@@ -81,6 +88,21 @@ final class CoreBridge: ObservableObject {
     }
 
     /// Refresh the installed-addons list (and the raw descriptors for uninstall) from ctx.profile.
+    ///
+    /// TOMBSTONE ENFORCEMENT (the load-bearing removal-sticks guard): `refreshAddons` is the SINGLE
+    /// point where the engine's ctx add-on set is published, and it fires on EVERY ctx change — including
+    /// after the live Stremio import path (`PullAddonsFromAPI` / `switchAccount` / `refreshFromAPI`),
+    /// which re-installs the whole Stremio add-on collection into the engine ctx, a tombstoned add-on
+    /// among them. The `syncDown` tombstone loop only runs on a strictly-newer account `.doc` pull, so a
+    /// Stremio import re-adds a dashboard-deleted add-on into the LIVE engine with no sync-doc pull to
+    /// catch it (the "keeps showing installed / reappeared in Stremio" bug). We close that here: any ctx
+    /// add-on that is in the durable removal set (`AddonTombstones`, which already folded in the web
+    /// dashboard's `doc.webAddonRemovals` + `doc.vortx.deletedAddons` on syncDown) and is NOT
+    /// official/protected is uninstalled from the engine and dropped from the published set, so a
+    /// dashboard deletion is honored the instant the engine re-surfaces it, on every ctx path — not only
+    /// on sync-down. A genuine fresh RE-install later still works: `installAddon` (the single hardened
+    /// installer every UI routes through) calls `AddonTombstones.forget` on a successful explicit install,
+    /// so the URL leaves the set before the engine re-emits ctx and is therefore NOT suppressed here.
     private func refreshAddons() {
         let typed = decode(CoreCtx.self, field: "ctx")?.profile.addons ?? []
         var raw: [String: [String: Any]] = [:]
@@ -89,6 +111,38 @@ final class CoreBridge: ObservableObject {
            let profile = object["profile"] as? [String: Any],
            let addons = profile["addons"] as? [[String: Any]] {
             for addon in addons { if let url = addon["transportUrl"] as? String { raw[url] = addon } }
+        }
+        // Enforce durable removal tombstones at the publish point. Official/protected stubs are NEVER
+        // tombstoned (a logout resets the engine to exactly those), so this can only ever remove a
+        // user-installed add-on the user explicitly deleted.
+        let removed = AddonTombstones.all()
+        if !removed.isEmpty {
+            func isTombstoned(_ descriptor: CoreDescriptor) -> Bool {
+                removed.contains(AddonTombstones.normalize(descriptor.transportUrl))
+                    && !descriptor.isOfficial && !descriptor.isProtected
+            }
+            let toUninstall = typed.filter(isTombstoned).compactMap { raw[$0.transportUrl] }
+            let survivingTyped = typed.filter { !isTombstoned($0) }
+            for descriptor in typed where isTombstoned(descriptor) {
+                raw.removeValue(forKey: descriptor.transportUrl)
+            }
+            let publishedRaw = raw
+            // Uninstall the tombstoned add-ons from the engine off this event-processing thread (mirrors
+            // the syncDown apply loop's @MainActor hop), so we never re-enter the engine synchronously
+            // while it is emitting the ctx event we are handling. tombstone:false via a direct dispatch
+            // because the URL is already in the set; re-recording would be a redundant no-op.
+            if !toUninstall.isEmpty {
+                Task { @MainActor [weak self] in
+                    for rawDescriptor in toUninstall {
+                        self?.dispatchCtx(["action": "UninstallAddon", "args": rawDescriptor])
+                    }
+                }
+            }
+            DispatchQueue.main.async { [weak self] in
+                self?.addons = survivingTyped
+                self?.rawAddonsByUrl = publishedRaw
+            }
+            return
         }
         DispatchQueue.main.async { [weak self] in
             self?.addons = typed
@@ -157,6 +211,11 @@ final class CoreBridge: ObservableObject {
             if alreadyInstalled, let existing = rawAddonsByUrl[normalized] {
                 dispatchCtx(["action": "UninstallAddon", "args": existing])
             }
+            // An EXPLICIT install supersedes any prior removal tombstone for this URL: clear it so the
+            // freshly-installed add-on is not instantly re-uninstalled by refreshAddons' tombstone
+            // enforcement, and so the next sync push stops carrying the stale removal in the account doc.
+            // A genuine fresh install of a previously-deleted add-on therefore works on every device.
+            AddonTombstones.forget(url.absoluteString)
             let descriptor: [String: Any] = [
                 "transportUrl": url.absoluteString,
                 "manifest": manifest,
@@ -1277,16 +1336,11 @@ final class CoreBridge: ObservableObject {
             let items = Self.pruneFinished(decode(CoreCWPreview.self, field: "continue_watching_preview")?.items ?? [])
             DispatchQueue.main.async { [weak self] in self?.continueWatching = items }
         }
-        // The board needs ctx (addon manifests) for row titles, so rebuild on either change.
+        // The board needs ctx (addon manifests) for row titles, so rebuild on either change. Coalesced: a
+        // launch/page-land burst of `board` events collapses into a single trailing rebuild instead of N
+        // full decodes + republishes (the on-open lag). The rebuild itself still decodes off-main.
         if fields.contains("board") || fields.contains("ctx") {
-            let rows = buildBoardRows()
-            let boardState = decode(CoreBoardState.self, field: "board")   // decode off-main; reconcile on main
-            DispatchQueue.main.async { [weak self] in
-                guard let self else { return }
-                self.reconcileBoardRowPagination(boardState)   // #95: settle per-row horizontal pagination
-                self.boardRows = rows
-                self.boardPageInFlight = false
-            }
+            scheduleBoardRebuild()
         }
         if fields.contains("ctx") {
             DispatchQueue.main.async { [weak self] in self?.addonNamesCache = nil }   // addon set changed → rebuild name map
@@ -1372,6 +1426,35 @@ final class CoreBridge: ObservableObject {
     }
 
     // MARK: Board assembly
+
+    /// Coalesce a burst of `board` / `ctx` emits into ONE board rebuild. Called from the worker thread on every
+    /// such emit; it hops to the main actor (where the debounce state lives), cancels any pending rebuild, and
+    /// schedules a single trailing one ~80 ms after the last emit. The rebuild's heavy JSON decode
+    /// (`buildBoardRows`) runs off the main thread; only the `boardRows` assignment lands on main. Net effect:
+    /// the launch/page-land storm that used to fire N full decodes + N republishes now fires exactly one.
+    private func scheduleBoardRebuild() {
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.boardRebuildWork?.cancel()
+            let work = DispatchWorkItem { [weak self] in
+                guard let self else { return }
+                // Decode + assemble off the main thread (same as the old inline path, which also ran off-main).
+                DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+                    guard let self else { return }
+                    let rows = self.buildBoardRows()
+                    let boardState = self.decode(CoreBoardState.self, field: "board")
+                    DispatchQueue.main.async { [weak self] in
+                        guard let self else { return }
+                        self.reconcileBoardRowPagination(boardState)   // #95: settle per-row horizontal pagination
+                        self.boardRows = rows
+                        self.boardPageInFlight = false
+                    }
+                }
+            }
+            self.boardRebuildWork = work
+            DispatchQueue.main.asyncAfter(deadline: .now() + Self.boardRebuildDebounce, execute: work)
+        }
+    }
 
     /// Build titled board rows: merge each catalog's ready pages into one item list and resolve a
     /// human title from the installed-addon manifests. Rows with no loaded items are skipped, so they

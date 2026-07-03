@@ -318,6 +318,10 @@ struct iOSDetailView: View {
         /// When this launch resolved a NATIVE debrid link, the provenance to reresolve a fresh link on a
         /// later Continue-Watching resume (recorded into LastStreamStore on play). nil for torrent/direct.
         var debridRef: DebridPlaybackRef? = nil
+        /// True when the user explicitly chose this exact source (a tapped source-list row / quality pick),
+        /// false for an auto-pick (Watch Now / Continue-Watching resume). The player honors an explicit
+        /// pick on a start-timeout (retry in place) instead of silently hopping to a lower-quality source.
+        var wasExplicitPick: Bool = false
     }
 
     /// The LIVE page's fixed artwork band (the VOD hero scales with the viewport via `heroBandHeight`).
@@ -514,7 +518,7 @@ struct iOSDetailView: View {
                     url: launch.url, title: launch.title, headers: launch.headers, resumeSeconds: launch.resume,
                     recordMeta: launch.meta, recordQualityText: launch.qualityText,
                     recordBingeGroup: launch.bingeGroup, recordIsTorrent: launch.isTorrent,
-                    recordDebridRef: launch.debridRef,
+                    recordDebridRef: launch.debridRef, startedFromExplicitPick: launch.wasExplicitPick,
                     // reportProgress feeds the engine Player (TimeChanged) so Continue Watching updates live and
                     // watched time is tracked; saveProgress keeps the signed-in remote/overlay sync. iOS was only
                     // doing the latter, so nothing reached the engine and CW never updated (tvOS does both).
@@ -1928,11 +1932,14 @@ struct iOSDetailView: View {
         let prime = ref == nil
         if prime { primePlayback(stream) } else { core.loadEnginePlayer(for: stream) }
         let pm = moviePlaybackMeta
+        // A tapped source-list row / quality pick is an EXPLICIT choice: the player honors it on a
+        // start-timeout (retries in place) rather than hopping to a different, lower-quality source.
         presentation = .player(PlayerLaunch(url: ref?.url ?? url, title: pm.name, headers: stream.requestHeaders,
                                             resume: await resume(pm), meta: pm,
                                             qualityText: StreamRanking.signature(stream),
                                             bingeGroup: stream.behaviorHints?.bingeGroup,
-                                            isTorrent: !prime && stream.isTorrent, debridRef: ref))
+                                            isTorrent: !prime && stream.isTorrent, debridRef: ref,
+                                            wasExplicitPick: true))
     }
 
     #if !os(tvOS)
@@ -2496,6 +2503,7 @@ struct iOSEpisodeStreams: View {
                     cachedHashes: debridCache.cachedHashes,
                     cachedUsenetURLs: debridCache.cachedUsenetURLs,
                     play: { stream, url in Task { await play(stream, url: url) } },
+                    playAuto: { stream, url in Task { await play(stream, url: url, explicit: false) } },
                     playBest: { candidates in Task { await playBest(candidates) } },
                     download: episodeDownloadHandler
                 )
@@ -2547,6 +2555,7 @@ struct iOSEpisodeStreams: View {
             PlayerScreen(
                 url: launch.url, title: launch.title, headers: launch.headers, resumeSeconds: launch.resume,
                 recordMeta: launch.meta, recordQualityText: launch.qualityText, recordIsTorrent: launch.isTorrent,
+                startedFromExplicitPick: launch.wasExplicitPick,
                 episodes: seasonEpisodes.map { PlayerEpisodeRef(id: $0.id, label: "S\($0.season ?? 1)E\($0.episodeNumber) · \($0.episodeTitle)") },
                 loadEpisode: { await loadEpisodeStream($0) },
                 warmNextEpisode: { await warmEpisodeStream($0) },
@@ -2653,7 +2662,10 @@ struct iOSEpisodeStreams: View {
     /// SxEy file in a season pack via the episode hint. Fail-soft (no-key is a zero-await nil → the
     /// passed-in `url`/torrent path, unchanged). A debrid URL is a remote direct stream: skip the torrent
     /// prime and mark isTorrent:false.
-    private func play(_ stream: CoreStream, url: URL) async {
+    /// `explicit`: true when the user tapped this exact source row / quality (honor it in the player, no
+    /// silent hop on a start-timeout); false when it is an auto fallback (the ranked-best Watch path /
+    /// the parallel-cached race's single-resolve fallback), which may hop normally.
+    private func play(_ stream: CoreStream, url: URL, explicit: Bool = true) async {
         guard !preparing else { return }
         preparing = true; defer { preparing = false }
         let ep = video.season.flatMap { s in video.episode.map { DebridEpisode(season: s, episode: $0) } }
@@ -2672,7 +2684,7 @@ struct iOSEpisodeStreams: View {
         player = iOSDetailView.PlayerLaunch(url: playURL, title: name, headers: stream.requestHeaders,
                                             resume: await resume(pm), meta: pm,
                                             qualityText: StreamRanking.signature(stream),
-                                            isTorrent: isTorrent, debridRef: ref)
+                                            isTorrent: isTorrent, debridRef: ref, wasExplicitPick: explicit)
     }
 
     /// AUTO-PICK play for the episode "Watch in <quality>" button: race the top few CACHED candidates
@@ -2708,7 +2720,7 @@ struct iOSEpisodeStreams: View {
         preparing = false   // release before the fallback, which re-guards on `preparing` inside `play`
         // No parallel-cached winner: today's single-resolve on the ranked best (first playable candidate).
         guard let best = candidates.first(where: { $0.playableURL != nil }), let url = best.playableURL else { return }
-        await play(best, url: url)
+        await play(best, url: url, explicit: false)   // auto Watch fallback: may hop normally
     }
 
     #if !os(tvOS)
@@ -2925,6 +2937,11 @@ struct iOSSourceList: View {
     /// keep the default true — there the control bar is the only primary action.
     var showsPrimaryControls = true
     let play: (CoreStream, URL) -> Void
+    /// AUTO single-resolve for the primary "Watch in <quality>" button's FALLBACK (used only when
+    /// `playBest` is nil): the ranked-best source played as an AUTO pick, so the player may hop normally on
+    /// a start-timeout. Distinct from `play` (a per-row / quality tap), which is an EXPLICIT choice the
+    /// player honors in place. Defaults to `play` when the caller doesn't wire an auto variant.
+    var playAuto: ((CoreStream, URL) -> Void)? = nil
     /// AUTO-PICK play for the primary "Watch in <quality>" button ONLY: hands the caller the ranked
     /// candidate list (best first) so it can race the top few CACHED sources in parallel and play the first
     /// that resolves, reaching a genuinely-cached link fast instead of committing to `best` alone. Optional:
@@ -3103,7 +3120,7 @@ struct iOSSourceList: View {
                     // gate. The Quality picker stays live so a manual pick is always available immediately.
                     // AUTO-PICK: race the top cached candidates in parallel via `playBest` when the caller
                     // wired it (best first, ranking order preserved), else the single-resolve `play(best)`.
-                    Button { if let playBest { playBest(groups.flatMap(\.streams)) } else { play(best, url) } } label: {
+                    Button { if let playBest { playBest(groups.flatMap(\.streams)) } else { (playAuto ?? play)(best, url) } } label: {
                         if loading {
                             HStack(spacing: Theme.Space.sm) {
                                 ProgressView().tint(Theme.Palette.onAccent)
