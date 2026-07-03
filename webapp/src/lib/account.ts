@@ -10,6 +10,7 @@
 import { loadSession, clearSession, validateSession, saveSession, getSyncDoc, mutateSyncDoc, type Session } from "./vault";
 import {
   mergeInstalledAddons,
+  pruneInstalledAddons,
   applyAddonOrder,
   registerAddonsSyncPusher,
   registerCwSyncPusher,
@@ -205,8 +206,20 @@ export function applySyncDoc(doc: Record<string, unknown> | null | undefined): v
     const u = addonUrl(a);
     if (u) urls.push(u);
   }
-  const addonsChanged = mergeInstalledAddons(urls);
-  const orderChanged = applyAddonOrder(urls);
+  // Removal tombstone (doc.removedAddons: { [transportUrl]: removedAtEpochMs }): a URL the user deleted on
+  // ANY VortX surface. mergeInstalledAddons only ever UNIONs, so without subtracting the tombstone here a
+  // deleted add-on that still lives in vortx.addons (app channel) or a Stremio re-import would be added
+  // straight back - THAT is the "I removed YouTube/Watch Hub but it keeps coming back" bug. Re-adding a URL
+  // clears its tombstone (add wins LWW), so a genuine re-install still sticks. Filter it out of the union
+  // AND prune any copy already persisted locally so it disappears immediately, not just stops re-adding.
+  const removedSet = new Set(
+    doc.removedAddons && typeof doc.removedAddons === "object" ? Object.keys(doc.removedAddons) : [],
+  );
+  const liveUrls = removedSet.size ? urls.filter((u) => !removedSet.has(u)) : urls;
+  const addedChanged = mergeInstalledAddons(liveUrls);
+  const prunedChanged = removedSet.size ? pruneInstalledAddons([...removedSet]) : false;
+  const addonsChanged = addedChanged || prunedChanged;
+  const orderChanged = applyAddonOrder(liveUrls);
 
   // Owner library (vortx.library: [{id,name,type,poster,t,d,lastWatched,v,...}]). The app emits t/d in
   // seconds (the dashboard + now the web app derive Continue Watching from each item's progress).
