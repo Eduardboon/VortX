@@ -166,6 +166,7 @@ jobs:
         run: |
           xcodebuild -project app/VortX.xcodeproj -scheme VortXMac \
             -configuration Release -destination 'platform=macOS,arch=arm64' \
+            ARCHS=arm64 ONLY_ACTIVE_ARCH=NO \
             -derivedDataPath app/build/ci-mac CODE_SIGNING_ALLOWED=NO build
 
       - name: Package the IPAs
