@@ -9,7 +9,7 @@ android {
     // Media3 1.7+ must be built against SDK 35, so compileSdk moves 34 -> 35. AGP 8.5.2 supports it.
     // targetSdk stays at 34: bumping the runtime target is a separate behavioral change, not needed
     // to adopt the player. minSdk stays 26 (already above Media3 1.9's floor of 23).
-    compileSdk = 35
+    compileSdk = 36
 
     defaultConfig {
         applicationId = "com.stremiox.android"
@@ -110,7 +110,7 @@ dependencies {
     // so this dependency is confined to the `full` (sideload) flavor via `fullImplementation` and is
     // NEVER pulled into the `play` (Play-Store) flavor. This mirrors the Apple sideloaded MPVKit-GPL
     // distribution model. Coordinate resolves from mavenCentral() (already in settings.gradle.kts).
-    "fullImplementation"("dev.jdtech.mpv:libmpv:0.5.1")
+    "fullImplementation"("dev.jdtech.mpv:libmpv:1.0.0")
 
     debugImplementation("androidx.compose.ui:ui-tooling")
 
