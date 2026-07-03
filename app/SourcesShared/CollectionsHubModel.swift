@@ -272,9 +272,12 @@ final class CollectionsHubModel: ObservableObject {
     private var genreTask: Task<Void, Never>?
     private var discoverTask: Task<Void, Never>?
 
-    /// Always available now: the keyless catalogs.vortx.tv edge serves the hub (Discover/services/genres)
-    /// even with no user TMDB key, so the hub shows for everyone. A user key just routes straight to TMDB.
-    static var isAvailable: Bool { true }
+    /// Available now: the keyless catalogs.vortx.tv edge serves the hub (Discover/services/genres) even with
+    /// no user TMDB key, so the hub shows for everyone. A user key just routes straight to TMDB.
+    /// Gated by the RemoteConfig fleet kill-switch `features.collectionsHub`: a remote `false` hides the hub
+    /// fleet-wide (e.g. if the catalogs edge is down). Baked default true => absent/null remote is identical
+    /// to shipping.
+    static var isAvailable: Bool { RemoteConfig.snapshot.isFeatureOn("collectionsHub", default: true) }
 
     /// Load the provider tiles for the region. Uses the cadence-throttled cache: if a fresh cached list
     /// exists it is shown immediately and no network call is made; otherwise it fetches and re-caches.

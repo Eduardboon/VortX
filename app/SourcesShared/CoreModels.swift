@@ -4,6 +4,21 @@ import Foundation
 /// engine's serde output (camelCase, with a few explicit renames). `Core`-prefixed to avoid clashing
 /// with the legacy hand-rolled models (MetaPreview, Descriptor, …) during the screen-by-screen migration.
 
+/// A whole-seconds count to a compact timecode: "M:SS" under an hour, "H:MM:SS" past it. The shared
+/// "resume 1:03" / "45:12" / "1:12:30" affordance used on Continue Watching cards and the detail
+/// primary button (mirrors the webapp's `formatTime`). Returns nil for non-positive input so callers
+/// can cleanly omit the badge / suffix when there is nothing to resume.
+func resumeTimecode(_ seconds: Double) -> String? {
+    guard seconds.isFinite, seconds >= 1 else { return nil }
+    let total = Int(seconds)
+    let h = total / 3600
+    let m = (total % 3600) / 60
+    let s = total % 60
+    return h > 0
+        ? String(format: "%d:%02d:%02d", h, m, s)
+        : String(format: "%d:%02d", m, s)
+}
+
 // MARK: continue_watching_preview
 
 struct CoreCWPreview: Decodable {
@@ -28,6 +43,10 @@ struct CoreCWItem: Decodable, Identifiable {
         guard state.duration > 0 else { return 0 }
         return min(max(state.timeOffset / state.duration, 0), 1)
     }
+
+    /// The saved resume position in whole seconds (`timeOffset` is ms), so a card can show where
+    /// playback will pick up ("Resume 1:03"). 0 when nothing has been played into this title.
+    var resumeSeconds: Double { max(0, state.timeOffset / 1000) }
 }
 
 struct CoreLibState: Decodable {
@@ -505,9 +524,23 @@ struct CoreStream: Decodable, Identifiable {
     let name: String?
     let description: String?
     let behaviorHints: CoreStreamBehaviorHints?
+    /// Native Stremio USENET source fields (part of the stream spec, alongside url / ytId / infoHash):
+    /// `nzbUrl` is an http(s) link to an `.nzb`, and `fileMustInclude` is an optional regex that picks the
+    /// video inside the (potentially multi-file) usenet download. A stream with a non-nil `nzbUrl` is a
+    /// USENET stream — it resolves through the user's own usenet-capable debrid account (TorBox), never a
+    /// torrent swarm. All optional so a stream without them (every torrent/direct/YouTube source) still
+    /// decodes byte-identically to before.
+    let nzbUrl: String?
+    let fileMustInclude: String?
 
-    var id: String { (url ?? externalUrl ?? infoHash ?? "?") + "#" + (name ?? "") + (description ?? "") }
-    var isTorrent: Bool { url == nil && infoHash != nil }
+    var id: String { (url ?? externalUrl ?? infoHash ?? nzbUrl ?? "?") + "#" + (name ?? "") + (description ?? "") }
+    var isTorrent: Bool { url == nil && infoHash != nil && nzbUrl == nil }
+
+    /// A USENET stream: no direct `url` yet, but an `.nzb` link to resolve through a usenet-capable debrid
+    /// account. Like a raw torrent, it needs resolution before it is playable — the usenet analogue of
+    /// `isTorrent`. Kept mutually exclusive from `isTorrent` (which now also checks `nzbUrl == nil`) so a
+    /// stream is classified as exactly one of torrent / usenet / direct.
+    var isUsenet: Bool { url == nil && (nzbUrl.map { !$0.isEmpty } ?? false) }
 
     /// A bare YouTube source (`ytId`, no direct `url`): a trailer/clip from a trailer add-on like
     /// Streailer, not a full feature stream. Playable (via the `/yt` route in `playableURL`) so the
@@ -519,14 +552,23 @@ struct CoreStream: Decodable, Identifiable {
     /// Direct/debrid URLs play as-is; torrents go through the embedded streaming server.
     ///
     /// A `ytId`-only stream is a YouTube source (e.g. a trailer add-on like Streailer returns
-    /// `{ "ytId": "…" }` streams, no `url`/`infoHash`): play it through the embedded server's
-    /// `/yt/{id}` route — the same InnerTube redirect the Trailer button uses (`TrailerRequest`).
-    /// Gated on `canProxy` so the Lite build (no embedded server) leaves it non-playable, exactly
-    /// as before. Without this, every Streailer stream rendered as an inert lock-icon row.
+    /// `{ "ytId": "…" }` streams, no `url`/`infoHash`): play it through the remote resolver's
+    /// `/yt/{id}` route — the same path the Trailer button uses (`TrailerRequest`). The remote
+    /// resolver needs no embedded server, so this is playable on every scheme including Lite.
+    /// Without this, every Streailer stream rendered as an inert lock-icon row.
     var playableURL: URL? {
         if let url, let parsed = URL(string: url) { return parsed }
-        if let ytId, !ytId.isEmpty, StremioServer.canProxy {
-            return URL(string: "\(StremioServer.base)/yt/\(ytId)")
+        // USENET: playable only when a TorBox key can resolve it. The play path
+        // (`DebridCoordinator.resolvedPlaybackRef`) turns the nzb into a direct https link BEFORE the
+        // player sees any URL; the nzb link here only makes the row tappable / identifies it. Without
+        // this, every usenet row rendered as a dead disabled label (every row gate keys on this
+        // property). No TorBox key -> nil, the pre-usenet behavior. Deliberately NOT behind the
+        // torrents gate: usenet resolves to a remote link, no embedded server needed (Lite plays it).
+        if isUsenet, DebridKeys.shared.isConfigured(.torBox), let nzb = nzbUrl, let parsed = URL(string: nzb) {
+            return parsed
+        }
+        if let ytId, !ytId.isEmpty {
+            return URL(string: "\(StremioServer.trailerResolverBase)/yt/\(ytId)")
         }
         guard !PlaybackSettings.torrentsDisabled else { return nil }
         guard let hash = infoHash?.lowercased() else { return nil }

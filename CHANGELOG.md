@@ -4,7 +4,57 @@ All notable changes to VortX, newest first. VortX is Apple TV first, with an iPh
 
 What is planned next is in [ROADMAP.md](ROADMAP.md). To request a feature or report a bug, start a [GitHub Discussion](https://github.com/VortXTV/VortX/discussions) or [open an issue](https://github.com/VortXTV/VortX/issues).
 
-## Unreleased
+## 0.3.9 - build 150
+
+Build 149 adds offline HLS downloads on iPhone and iPad (adaptive .m3u8 sources now download properly as a system-managed bundle and play back offline, instead of failing), a fleet of reliability fixes from an adversarial code-review sweep of the 147 changes (a catalog category that could get stuck on an endless spinner when you switched between pills; a hub tile that could open twice on a slow connection; a hub detail whose action buttons could disagree with its body), and a hardened Discover edge cache that no longer freezes a missing rating from a transient upstream hiccup and no longer stampedes the shared key when a popular row goes stale.
+
+
+This build is finished and in final testing across every device; the release is cut once that pass is clean. A big, cross-cutting release: your language everywhere (over 100 languages, and titles, posters, and logos localized across every catalog), a Discover you can shape to your region and taste, a cleaner and more cinematic look on iPhone, iPad, and Mac, community subtitles with an "also available in" language row, Dolby Vision from MKV files, TorBox usenet and search, install add-ons by scanning a QR code, and a wave of player and detail-page polish. In-place update, nothing resets.
+
+### Added
+
+- **Over 100 languages.** The interface now speaks more than 100 languages (up from 64), with an in-app language picker and right-to-left layout for Arabic, Hebrew, Persian, and Urdu. Choose a specific language in Settings or follow your device automatically.
+- **Titles, posters, and logos in your language.** Metadata now localizes across every catalog: a title's name, poster, and logo show in your language when the source has them, drawn from VortX's own localized-metadata service so it works without your own key.
+- **A Discover you can shape.** New personalization controls put your region and taste first: order catalogs by your region, turn individual Discover categories on or off, and localize the rows to your language. Set it all in Settings.
+- **Community subtitles, fast and in sync.** Subtitles now load quickly from a shared community pool and stay in sync, and every title shows an "also available in" row of the other languages a subtitle exists in, so you can tell at a glance what a title offers.
+- **A working subtitle-sync control.** Nudge subtitles earlier or later in the player when a track runs ahead of or behind the audio, and the offset sticks for that title.
+- **Dolby Vision from MKV files.** A Dolby Vision MKV now plays with true DV passthrough on a DV-capable display, alongside the MP4, MOV, and HLS containers that already did. Turn it on in Settings, Playback; it falls back automatically when a file cannot take that path.
+- **TorBox usenet and search.** TorBox now resolves usenet (NZB) sources and runs its built-in search, so a TorBox key surfaces more cached and searchable results, not just torrents.
+- **A debrid cache indicator.** A source that is already cached on your debrid account shows a clear "cached" marker in the list and ranks higher, so instant-playing sources are obvious at a glance.
+- **Install add-ons by QR code.** Scan a QR code with your phone to install an add-on to your account, no typing on the TV. It syncs to your other devices like any other add-on.
+- **Pick a trailer's language.** Choose which language a title's trailer prefers, so the in-hero and detail-page trailer matches how you watch.
+- **Resume timestamps.** Continue Watching and the detail page now show where you left off as a timestamp, so you can see how far in you are before you resume.
+- **Poster Style settings, with a live preview.** Settings -> Appearance -> Poster Style lets you set poster card width (Compact through Large, Balanced is the default), corner radius (Sharp through Pill, Rounded is the default), landscape 16:9 art, and hiding the title labels, with a sample poster that updates as you change each option. Defaults match today's look, so nothing changes unless you opt in. iPhone, iPad, and Mac.
+- **Cast & Crew is now a tap-to-expand section on the title page.** It stays collapsed by default so the page reads cleaner, and expands smoothly to show the cast, director, and writer when you tap it. iPhone, iPad, and Mac.
+- **Hide poster labels from Settings -> Appearance.** The toggle used to live only inside Poster Style; it is now surfaced in the main Appearance section too, and it applies consistently across every poster row (Discover, Home, Continue Watching, and More Like This). iPhone, iPad, and Mac.
+- **Combine Discover and Search into one tab.** A new Settings -> Appearance toggle (off by default) folds Search into Discover, with a search field above the browse, so the tab bar is less crowded on phones. Turn it off any time to get the separate Search tab back. iPhone, iPad, and Mac.
+- **A buffered-ahead indicator on the player scrubber.** A light grey track now sits behind the playhead showing how far playback has loaded ahead, just like YouTube. It works on every device and both playback engines, and stays out of the way of the seek-bar styles, chapter ticks, and skip markers. Apple TV, iPhone, iPad, and Mac.
+
+### Changed
+
+- **A cleaner, more cinematic look across the app.** Title pages now lead with full-bleed artwork that fades smoothly into the background, a circular back and more button over the art, a big high-contrast Play button, and a more spacious layout. The home billboard gets a rounded "View Details" pill, pager dots, and the same smooth artwork fade, and Continue Watching cards get a tidier progress bar. iPhone, iPad, and Mac.
+- **Mac now uses the full width of the window.** A larger hero, a roomier reading column for the synopsis and cast, and the wordmark tucked clear of the window controls, so the Mac app reads as a desktop layout rather than a stretched phone.
+- **Tap the active tab again to jump back to the top.** On Apple TV and on iPhone, iPad, and Mac, selecting the tab you are already on scrolls that screen back to the top.
+- **The muted trailer behind the hero is now the real full trailer.** On Home and title pages, the quiet looping clip that plays behind the artwork now uses the same full trailer as the Trailer button (the app's native trailer resolver), instead of a separate short billboard snippet. It plays muted and loops, and when a title has no trailer the still artwork stays exactly as before. Apple TV, iPhone, iPad, and Mac.
+
+### Fixed
+
+- **The "More Like This" row on a title page now follows your poster style.** It was locked to portrait posters even when you had chosen landscape 16:9 art; it now matches the orientation, size, and label settings of every other poster row. iPhone, iPad, and Mac.
+- **Add-ons page no longer clips at the edges or stacks an add-on's name one letter per line.** On a narrow phone the action buttons were squeezing the name and details into a sliver; each add-on now lays its icon and text across the full width, with the action buttons on their own row beneath.
+- **Continue Watching resumes faster and more reliably, straight from your debrid account,** so picking up where you left off no longer stalls or asks you to choose a source again when the saved link has expired.
+- **Apple TV focus fixes,** so moving through Home, Discover, and the Collections hub steps row by row in order; pressing down from the first hub row no longer skips the Streaming Services row.
+- **Hardened how VortX fetches remote resources** so a malicious add-on or link cannot make the app reach an unintended internal address (SSRF protection).
+- **Trending, genre, and streaming-service tiles now open to a full title page on iPhone, iPad, and Mac.** Tapping one of these hub tiles now resolves it to the same title the rest of the app uses, so the artwork, ratings, cast, and a working Play button all appear, the way they already did on Apple TV.
+- **Catalogs keep showing posters and art even when a source is busy.** The catalog service now serves the last good response while it refreshes in the background, and keeps serving it if the upstream is rate-limited or down, so rows no longer go blank or stick on "Nothing here yet".
+- **The synopsis no longer appears twice on a title page.** The full description below the action row now shows only when it is meaningfully longer than the excerpt already shown on the hero.
+- **Apple TV now shows full language names in the "also available in" row** (English, Français, and so on) instead of two-letter codes, matching iPhone, iPad, and Mac.
+- **More reliable downloads.** The Downloads folder is now created and verified before a file is saved, closing one cause of a "couldn't save this download" error. Thanks to a community member for contributing the fix.
+- **Downloads now fail clearly on sources that can't be saved as a file.** A source that streams in segments (HLS) or resolves through a web page (some add-ons, for example ok.ru) no longer produces a broken few-KB file or an opaque error; it now reports plainly that it can't be saved for offline. True offline HLS download is planned. Thanks to the same community member for flagging it.
+- **Scrub-preview thumbnails now generate correctly on Mac** during 4K and Dolby Vision playback.
+- **Scrub-preview thumbnails now build and share from every title,** including plays started from Streaming Services, Trending, and genre collection tiles, and short watches now count toward the shared previews instead of being discarded.
+- **Trailers play directly from your device at up to 1080p.** The app now resolves a title's trailer on the spot from your own connection and plays it straight, instead of routing through a server, so trailers start faster and look sharper; the ambient trailer behind the hero uses the same path, and a server fallback keeps trailers working if the direct resolve cannot.
+- **Cached sources reach a playable one much faster.** RealDebrid retired the check that let VortX confirm a source was cached on your account, so a source could look cached (from the add-on's own label) yet not be ready; tapping it used to wait out a long timeout. The player now detects that within a couple of seconds and moves on, so a run of not-actually-cached sources no longer stalls you before one plays.
+- **What's New now has a page on Apple TV too,** under Settings, rendering the full changelog, matching iPhone, iPad, and Mac.
 
 ## 0.3.8 Beta 16 - 2026-06-30 (pre-release)
 

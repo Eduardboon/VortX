@@ -33,6 +33,27 @@ enum TrailerOpener {
     }
 }
 
+/// Probes whether a `trailer.vortx.tv/clip` mp4 is actually warmed in R2, shared by every iOS/Mac
+/// Trailer button (hero + detail). A cold clip returns an INSTANT 404 (`x-vortx-reason: clip_warming`,
+/// CDN-cached ~2 min) while the worker extracts in the background; handing that 404 to libmpv dead-ends
+/// on the full source-error screen ("Trailer unavailable."), so callers probe first and fall back to the
+/// YouTube IFrame embed on a miss. HEAD keeps the probe to headers only — the worker ignores `Range`, so
+/// a ranged GET would pull the entire mp4 just to learn it exists (verified: HEAD returns 200 on an
+/// R2 hit, 404 clip_warming on a miss, and still triggers the worker's background extract).
+/// Fail-soft: any transport error reads as not-ready (the caller falls back).
+enum TrailerClipProbe {
+    static func isReady(_ url: URL) async -> Bool {
+        var req = URLRequest(url: url, timeoutInterval: 5)
+        req.httpMethod = "HEAD"
+        req.setValue("VortX", forHTTPHeaderField: "User-Agent")
+        do {
+            let (_, resp) = try await URLSession.shared.data(for: req)
+            let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
+            return (200...299).contains(code)
+        } catch { return false }
+    }
+}
+
 /// Full-screen cover that plays a YouTube trailer via the keyless IFrame embed (Bug A). A black canvas
 /// fills the cover with the interactive `YouTubeEmbedView`; a Done button dismisses. Used by both the
 /// detail page Trailer button and (potentially) any other surface that has a yt id and a title.

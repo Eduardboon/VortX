@@ -27,8 +27,12 @@ final class ScrubThumbnailsStore: ObservableObject {
     /// The downloaded community sheet, when this title had one. While present, `show(time:)` serves a crop
     /// from it instead of the local cache, so a title brand-new to this device shows previews immediately.
     private var communitySheet: CommunityTrickplay.Sheet?
-    /// True when the L1 community fetch returned a set, so we skip the upload (first-writer already exists).
+    /// True when the L1 community fetch returned a set (used to serve it while scrubbing).
     private var communityAlreadyExists = false
+    /// Frame count of the community set the L1 fetch returned (0 = none). We only UPLOAD when our own capture
+    /// is strictly fuller than this, so a thin community set gets improved (keep-fuller) while a full one is
+    /// not needlessly re-POSTed. The worker also keep-fuller-merges as a race safety net.
+    private var communityExistingFrameCount = 0
     /// The shareable identity for the current title, set by `configureCommunity`. nil for ad-hoc plays.
     private var communityKey: String?
     private var communityImdb: String?
@@ -47,8 +51,11 @@ final class ScrubThumbnailsStore: ObservableObject {
     /// re-send when no new coverage arrived. Replaces the old one-shot `didUpload` (which lost everything to a
     /// missing teardown).
     private var lastUploadedCount = 0
-    /// Capture cadence the local pipeline records at (~every 10s); also the sheet/vtt tile interval.
-    private static let captureInterval: Double = 10
+    /// Capture cadence the local pipeline records at (~every 10s); also the sheet/vtt tile interval. Sourced
+    /// from the RemoteConfig `trickplay.captureIntervalSecs` dial (clamped 2..60), so the owner can tune
+    /// coverage density with no app update. Baked default 10 == the shipping value; a null/out-of-range remote
+    /// value keeps 10. Read once at use; the value is stable for a playback session.
+    private static var captureInterval: Double { Double(RemoteConfig.snapshot.captureIntervalSecs) }
 
     func configure(localCacheKey: String?) {
         guard self.localCacheKey != localCacheKey else { return }
@@ -57,7 +64,9 @@ final class ScrubThumbnailsStore: ObservableObject {
         // A new title: drop the previous community sheet + session frames.
         communitySheet = nil
         communityAlreadyExists = false
+        communityExistingFrameCount = 0
         communityKey = nil
+        communityResolveTriedFor = nil
         hasRealDuration = false
         sessionFrames = []
         lastUploadedCount = 0
@@ -68,13 +77,28 @@ final class ScrubThumbnailsStore: ObservableObject {
     /// may never deliver mpv's `duration` event), then AGAIN with `isRealDuration: true` once the real mpv
     /// duration arrives. The provisional call keys + fetches but never uploads; the real call re-keys if the
     /// duration bucket changed and flips `hasRealDuration` so uploads can begin. Fully fail-soft.
-    func configureCommunity(imdbId: String?, season: Int?, episode: Int?, duration: Double,
+    func configureCommunity(imdbId rawImdbId: String?, season: Int?, episode: Int?, duration: Double,
                             isRealDuration: Bool = true, enabled: Bool = CommunityTrickplay.isEnabled) {
+        // TMDB-keyed play (our hub/TMDB catalogs key with `tmdb:…`, not `tt…`): resolve to the IMDb identity
+        // so these plays contribute + fetch like any Cinemeta play. THE root cause of an account that never
+        // fed the pool from any device: every hub-launched play carried a tmdb id and was dropped below. A
+        // cached mapping proceeds inline; a miss kicks ONE async resolve and re-enters with the tt id (the
+        // chrome re-calls this every tick anyway, so the cache also catches the next call).
+        var imdbId = rawImdbId
+        if enabled, let raw = rawImdbId, raw.lowercased().hasPrefix("tmdb") {
+            if let tt = CommunityTrickplay.cachedIMDbID(for: raw) {
+                imdbId = tt
+            } else {
+                resolveCommunityIdentity(rawId: raw, season: season, episode: episode,
+                                         duration: duration, isRealDuration: isRealDuration)
+                return
+            }
+        }
         guard enabled, let imdbId, duration > 0,
               let key = CommunityTrickplay.contentKey(imdbId: imdbId, season: season, episode: episode, duration: duration)
         else {
-            // Diagnose an empty server table: log WHY we never key (the usual culprit is a non-`tt` libraryId,
-            // e.g. a tmdb:/kitsu: id, so contentKey returns nil and nothing is ever captured for upload).
+            // Diagnose an empty server table: log WHY we never key (the remaining culprits are a non-tt,
+            // non-tmdb libraryId, e.g. kitsu:/paste-a-link, or a zero duration).
             if enabled, communityKey == nil {
                 NSLog("[trickplay] community NOT keyed (need a tt-imdb id + duration>0): imdb=%@ dur=%.0f", imdbId ?? "nil", duration)
             }
@@ -95,7 +119,7 @@ final class ScrubThumbnailsStore: ObservableObject {
         communityDurationBucket = CommunityTrickplay.durationBucket(duration)
         // A re-key under a new bucket invalidates a fetched sheet (it belonged to the old key); the new
         // fetch below replaces it. Captured session frames stay valid (they are time-indexed, not bucketed).
-        if rekeying { communitySheet = nil; communityAlreadyExists = false }
+        if rekeying { communitySheet = nil; communityAlreadyExists = false; communityExistingFrameCount = 0 }
         Task { [weak self] in
             let sheet = await CommunityTrickplay.fetch(key: key)
             await MainActor.run {
@@ -103,7 +127,33 @@ final class ScrubThumbnailsStore: ObservableObject {
                 if let sheet {
                     self.communitySheet = sheet
                     self.communityAlreadyExists = true
+                    self.communityExistingFrameCount = sheet.frameCount
                 }
+            }
+        }
+    }
+
+    /// The raw `tmdb:…` id currently being (or already) resolved, so a burst of per-tick `configureCommunity`
+    /// calls (timePos handler + wall-clock timer) mints exactly ONE network resolve. Deliberately NOT cleared
+    /// on failure: it then marks the id one-shot-failed so the per-tick callers stop re-firing the lookup
+    /// (the session stays local-only, exactly the old behavior). Reset per title in `configure`.
+    private var communityResolveTriedFor: String?
+
+    /// One-shot tmdb->imdb resolve, then re-enter `configureCommunity` with the tt identity. Fail-soft.
+    private func resolveCommunityIdentity(rawId: String, season: Int?, episode: Int?,
+                                          duration: Double, isRealDuration: Bool) {
+        guard communityResolveTriedFor != rawId else { return }
+        communityResolveTriedFor = rawId
+        Task { [weak self] in
+            let tt = await CommunityTrickplay.resolveIMDbID(rawId: rawId, seriesHint: season != nil)
+            await MainActor.run {
+                guard let self else { return }
+                guard let tt else {
+                    NSLog("[trickplay] tmdb->imdb resolve FAILED for %@ (session stays local-only)", rawId)
+                    return
+                }
+                self.configureCommunity(imdbId: tt, season: season, episode: episode,
+                                        duration: duration, isRealDuration: isRealDuration)
             }
         }
     }
@@ -142,7 +192,8 @@ final class ScrubThumbnailsStore: ObservableObject {
         #endif
         Self.localFrameCache.store(image: decoded, data: data, for: key, time: time)
         // Keep the raw JPEG for a possible community upload (bounded; the worker caps at 600 tiles anyway).
-        if communityKey != nil, !communityAlreadyExists, sessionFrames.count < 600 {
+        // Buffer EVEN when a community set already exists, so a fuller local capture can improve a thin one.
+        if communityKey != nil, sessionFrames.count < 600 {
             sessionFrames.append(CommunityTrickplay.CapturedFrame(time: time, jpeg: data))
             maybeUploadProgressively()   // upload DURING playback, not only at a teardown that may never fire
         }
@@ -156,9 +207,14 @@ final class ScrubThumbnailsStore: ObservableObject {
         // worker is overwrite-wins, so each push just improves the stored set; capture is ~every 10s, so a
         // minute is ~6 frames.
         let perMinute = max(1, Int(60.0 / Self.captureInterval))
-        // Gate on hasRealDuration: never upload under a provisional (meta.runtime) bucket, which could be
-        // wrong and would write a poisoned set under a key real players never read.
-        guard hasRealDuration, !communityAlreadyExists, CommunityTrickplay.isEnabled,
+        // NOTE: the old `hasRealDuration` gate here blocked EVERY upload for a debrid direct-HTTP MKV, because
+        // hasRealDuration is only set by mpv's `duration` event, which those streams frequently never deliver.
+        // That is exactly the content the owner watches, so trickplay uploaded nothing (build 138 regression).
+        // We upload under the provisional (meta.runtime) key instead: durationBucket rounding makes it match
+        // the real-duration bucket in the common case, the worker is keep-fuller (a thin set never clobbers a
+        // fuller one), and a later real-duration re-key re-uploads under the corrected key. Fully fail-soft.
+        guard CommunityTrickplay.isEnabled,
+              sessionFrames.count > communityExistingFrameCount,   // keep-fuller: only upload when we beat the stored set
               sessionFrames.count >= lastUploadedCount + perMinute,
               let key = communityKey, let imdb = communityImdb else { return }
         pushUpload(key: key, imdb: imdb)
@@ -168,11 +224,13 @@ final class ScrubThumbnailsStore: ObservableObject {
     /// disabled / no key / the community already had a set / no new coverage since the last upload.
     func finishAndUploadIfNeeded(srcHeight: Int = 0) {
         if srcHeight > 0 { communitySrcHeight = srcHeight }
-        // Gate on hasRealDuration too: a teardown before the real duration ever arrived must NOT flush a
-        // provisional-bucket set to the worker.
-        guard hasRealDuration, !communityAlreadyExists, CommunityTrickplay.isEnabled,
+        // No hasRealDuration gate (see maybeUploadProgressively) so a debrid MKV that never emitted mpv's
+        // `duration` event still flushes on exit. Store even a tiny capture (>=1 frame) so a short watch or a
+        // quick bug-test is never lost - the owner asked that even ~5s of coverage be stored + served.
+        guard CommunityTrickplay.isEnabled,
               let key = communityKey, let imdb = communityImdb,
-              sessionFrames.count >= 2, sessionFrames.count > lastUploadedCount else { return }
+              sessionFrames.count >= 1, sessionFrames.count > lastUploadedCount,
+              sessionFrames.count > communityExistingFrameCount else { return }
         pushUpload(key: key, imdb: imdb)
     }
 

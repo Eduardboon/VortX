@@ -50,7 +50,7 @@ class MetalLayer: CAMetalLayer {
         let handler = _captureHandler
         _captureHandler = nil
         let queue = captureCommandQueue
-        let dst = captureTexture
+        let initialDst = captureTexture   // read under the lock (class contract: all fields captureLock-guarded)
         captureLock.unlock()
 
         if let handler {
@@ -63,16 +63,20 @@ class MetalLayer: CAMetalLayer {
                 // required an exact match and otherwise dropped the frame (handler(nil)) -> EVERY 4K/HDR/DV
                 // frame was silently lost, so those titles never captured trickplay. Instead, reallocate the
                 // capture texture to match the source drawable's descriptor on a mismatch, then blit into it.
-                var dst = captureTexture
+                var dst = initialDst
                 if dst == nil || dst!.width != src.width || dst!.height != src.height || dst!.pixelFormat != src.pixelFormat {
                     let desc = MTLTextureDescriptor.texture2DDescriptor(
                         pixelFormat: src.pixelFormat, width: src.width, height: src.height, mipmapped: false)
                     desc.usage = [.shaderRead]
-                    #if os(macOS)
-                    desc.storageMode = .managed
-                    #else
+                    // .shared on EVERY platform (the Mac target is Apple-Silicon-only = unified memory). A
+                    // .managed texture keeps a separate CPU mirror that is NOT valid after a GPU blit until an
+                    // explicit blit.synchronize(resource:) - which this capture path never issues - so on macOS
+                    // the completion's CIImage(mtlTexture:) read a stale/empty mirror and the JPEG encode
+                    // silently returned nil, capturing ZERO community-trickplay frames for 4K/HDR/DV titles (the
+                    // reallocation branch ALWAYS fires for those, since the pre-allocated SDR/HD texture never
+                    // matches a 4K bgr10a2/rgba16F drawable). .shared has no CPU-sync gap and matches the sibling
+                    // allocator in MPVMetalViewController.updateCapturePipeline(), so both sites now agree.
                     desc.storageMode = .shared
-                    #endif
                     if let realloc = device?.makeTexture(descriptor: desc) {
                         dst = realloc
                         captureLock.lock(); captureTexture = realloc; captureLock.unlock()

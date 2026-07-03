@@ -105,13 +105,13 @@ struct TVDownloadsView: View {
                 return [record.sourceName, record.qualityText, size].compactMap { $0 }
             case .downloading:
                 let pct = Int(record.fractionComplete * 100)
-                return ["Downloading \(pct)%"]
+                return [String(localized: "Downloading \(pct)%")]
             case .paused:
-                return ["Paused"]
+                return [String(localized: "Paused")]
             case .failed:
-                return [record.errorText ?? "Failed"]
+                return [record.errorText ?? String(localized: "Failed")]
             case .queued:
-                return ["Queued"]
+                return [String(localized: "Queued")]
             }
         }()
         if !parts.isEmpty {

@@ -26,6 +26,7 @@ struct LibraryView: View {
                 BrowseHeroBackdrop(model: focusModel, detailsBottom: 520)
                 ScrollView {
                     VStack(alignment: .leading, spacing: Theme.Space.md) {
+                        Color.clear.frame(height: 0).scrollToTopAnchor()   // re-select Library tab -> scroll here
                         Text("Library").screenTitleStyle().padding(.horizontal, Theme.Space.screenEdge)
                         // Offline downloads (#30): a section ABOVE the saved-titles grid, shown only when at
                         // least one download exists. Plays from the local file with pause/resume/delete +
@@ -64,6 +65,8 @@ struct LibraryView: View {
                     .padding(.bottom, Theme.Space.xl)
                 }
                 .heroBottomStrip()
+                // Re-selecting the active Library tab scrolls back to the top.
+                .scrollToTopOnBump(TabScrollKeys.library)
             }
             .background(Theme.Palette.canvas.ignoresSafeArea())
         }

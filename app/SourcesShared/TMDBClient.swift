@@ -57,7 +57,12 @@ enum TMDBClient {
         let providers: [WatchProvider]
     }
 
-    static var deviceRegion: String { Locale.current.region?.identifier ?? "US" }
+    /// The region used for all TMDB region-scoped calls (watch providers, discover watch_region, release
+    /// dates). Honors the user's Discover region OVERRIDE first (Settings), else the device region, else US.
+    /// Reading the override here means every hub content path picks up the preference with no signature churn.
+    static var deviceRegion: String {
+        CatalogPrefsStore.regionOverride() ?? (Locale.current.region?.identifier ?? "US")
+    }
 
     static func watchProviders(imdbID: String, type: String, region: String = TMDBClient.deviceRegion) async -> WatchAvailability? {
         guard imdbID.hasPrefix("tt") else { return nil }
@@ -88,15 +93,24 @@ enum TMDBClient {
 
     /// The official YouTube trailer id for a title from TMDB's /videos (the source Stremio trailer add-ons
     /// use). Accepts an IMDb id (tt...) via /find or a `tmdb:[type:]id`. Requires a TMDB key; nil on no key,
-    /// no match, or no trailer. Prefers an official Trailer, then any YouTube Trailer/Teaser/Clip.
-    static func trailerYouTubeID(metaID: String, type: String) async -> String? {
+    /// no match, or no trailer.
+    ///
+    /// LANGUAGE PICK (`preferredLanguages`, ISO-639-1 codes in priority order, e.g. ["pt", "en"]): TMDB tags
+    /// each video with an `iso_639_1` language. For the WITH-SOUND "watch trailer" action we prefer a trailer
+    /// whose language matches the user's preferred language, then the title's ORIGINAL language, then English,
+    /// then the first/most-popular official Trailer. Within each language band an official Trailer beats a
+    /// non-official one, which beats a Teaser/Clip. Pass `[]` (the default) to keep the old
+    /// language-agnostic pick — the AMBIENT muted hero clip does not use this, so its behavior is unchanged.
+    static func trailerYouTubeID(metaID: String, type: String, preferredLanguages: [String] = []) async -> String? {
         let key = ApiKeys.effectiveTMDBKey()
         let media = (type == "series") ? "tv" : "movie"
         var tmdbID: Int?
+        var originalLanguage: String?
         if metaID.hasPrefix("tt") {
             guard let found = await get("/find/\(metaID)?external_source=imdb_id&api_key=\(key)"),
                   let first = (found[media == "tv" ? "tv_results" : "movie_results"] as? [[String: Any]])?.first else { return nil }
             tmdbID = first["id"] as? Int
+            originalLanguage = (first["original_language"] as? String)?.lowercased()
         } else if metaID.hasPrefix("tmdb:") {
             tmdbID = metaID.split(separator: ":").last.flatMap { Int($0) }
         }
@@ -104,13 +118,118 @@ enum TMDBClient {
               let vids = await get("/\(media)/\(id)/videos?api_key=\(key)"),
               let results = vids["results"] as? [[String: Any]] else { return nil }
         let youtube = results.filter { ($0["site"] as? String)?.lowercased() == "youtube" && $0["key"] is String }
-        func firstKey(where pred: ([String: Any]) -> Bool) -> String? {
-            youtube.first(where: pred).flatMap { $0["key"] as? String }
+        return pickTrailerKey(from: youtube, preferredLanguages: preferredLanguages, originalLanguage: originalLanguage).key
+    }
+
+    /// A picked trailer id plus whether it matched one of the caller's PREFERRED languages (vs. falling back to
+    /// original-language / English / first). Callers that only want to OVERRIDE a default trailer when the pick
+    /// is a genuine localized hit key on `matchedPreferred`.
+    struct TrailerPick { let key: String?; let matchedPreferred: Bool }
+
+    /// Language-preferred trailer id from TMDB /videos, returning whether the match was a real preferred-language
+    /// hit. Same resolution as `trailerYouTubeID` but surfaces `matchedPreferred` so the WITH-SOUND action can
+    /// decide whether the localized pick is worth preferring over the default (/clip mp4) path.
+    static func preferredTrailerPick(metaID: String, type: String, preferredLanguages: [String]) async -> TrailerPick {
+        let key = ApiKeys.effectiveTMDBKey()
+        let media = (type == "series") ? "tv" : "movie"
+        var tmdbID: Int?
+        var originalLanguage: String?
+        if metaID.hasPrefix("tt") {
+            guard let found = await get("/find/\(metaID)?external_source=imdb_id&api_key=\(key)"),
+                  let first = (found[media == "tv" ? "tv_results" : "movie_results"] as? [[String: Any]])?.first else { return TrailerPick(key: nil, matchedPreferred: false) }
+            tmdbID = first["id"] as? Int
+            originalLanguage = (first["original_language"] as? String)?.lowercased()
+        } else if metaID.hasPrefix("tmdb:") {
+            tmdbID = metaID.split(separator: ":").last.flatMap { Int($0) }
         }
-        if let k = firstKey(where: { ($0["type"] as? String) == "Trailer" && ($0["official"] as? Bool == true) }) { return k }
-        if let k = firstKey(where: { ($0["type"] as? String) == "Trailer" }) { return k }
-        if let k = firstKey(where: { ["Teaser", "Clip"].contains(($0["type"] as? String) ?? "") }) { return k }
-        return youtube.first.flatMap { $0["key"] as? String }
+        guard let id = tmdbID,
+              let vids = await get("/\(media)/\(id)/videos?api_key=\(key)"),
+              let results = vids["results"] as? [[String: Any]] else { return TrailerPick(key: nil, matchedPreferred: false) }
+        let youtube = results.filter { ($0["site"] as? String)?.lowercased() == "youtube" && $0["key"] is String }
+        return pickTrailerKey(from: youtube, preferredLanguages: preferredLanguages, originalLanguage: originalLanguage)
+    }
+
+    /// Choose a YouTube video `key` from TMDB /videos results by LANGUAGE then KIND. Language bands, in order:
+    /// each of `preferredLanguages` (ISO-639-1), the title's `originalLanguage`, English, then any language.
+    /// Within a band: an official Trailer, then any Trailer, then a Teaser/Clip. This is the single place the
+    /// "prefer the localized trailer" policy lives, so every caller (the language pick + the language-agnostic
+    /// default when `preferredLanguages` is empty) gets a consistent, fail-soft result. `key` is nil when the
+    /// list has no usable YouTube video; `matchedPreferred` is true only when the chosen video was in one of
+    /// `preferredLanguages` (not an original-language / English / any fallback), so a caller can decide whether
+    /// the pick is a genuine localized hit worth overriding a default trailer.
+    static func pickTrailerKey(from youtube: [[String: Any]], preferredLanguages: [String], originalLanguage: String?) -> TrailerPick {
+        func lang(_ v: [String: Any]) -> String { ((v["iso_639_1"] as? String) ?? "").lowercased() }
+        func kindRank(_ v: [String: Any]) -> Int {
+            let t = (v["type"] as? String) ?? ""
+            let official = (v["official"] as? Bool) == true
+            if t == "Trailer", official { return 0 }
+            if t == "Trailer" { return 1 }
+            if t == "Teaser" || t == "Clip" { return 2 }
+            return 3
+        }
+        // Best (lowest-kind-rank) YouTube video whose language is in `codes`; nil if none match.
+        func best(in codes: [String]) -> String? {
+            let set = Set(codes.filter { !$0.isEmpty })
+            guard !set.isEmpty else { return nil }
+            return youtube.filter { set.contains(lang($0)) }
+                .min { kindRank($0) < kindRank($1) }
+                .flatMap { $0["key"] as? String }
+        }
+        // Preferred language(s) first (a genuine localized hit), then the title's original language, then English.
+        for code in preferredLanguages where !code.isEmpty {
+            if let k = best(in: [code]) { return TrailerPick(key: k, matchedPreferred: true) }
+        }
+        if let orig = originalLanguage, let k = best(in: [orig]) { return TrailerPick(key: k, matchedPreferred: false) }
+        if let k = best(in: ["en"]) { return TrailerPick(key: k, matchedPreferred: false) }
+        // No language matched: fall back to the best video regardless of language (old behavior).
+        let k = youtube.min { kindRank($0) < kindRank($1) }.flatMap { $0["key"] as? String }
+        return TrailerPick(key: k, matchedPreferred: false)
+    }
+
+    /// The `stremiox.trailerLanguage` explicit picker value (D11), if the user set one in Settings. Empty /
+    /// absent means "follow the app UI language" (the default), which `preferredTrailerLanguages` already
+    /// applies via `AppLanguage.current`. When set, it is the HIGHEST-priority trailer language so the pick
+    /// honors the user's explicit choice over the UI language / audio / device order. Shared with the trailer
+    /// URL builders so the `/yt?lang=` hint matches the id the app selected.
+    static var trailerLanguageOverride: String? {
+        let v = UserDefaults.standard.string(forKey: "stremiox.trailerLanguage")
+        return (v?.isEmpty ?? true) ? nil : v
+    }
+
+    /// The user's preferred trailer languages as ISO-639-1 codes, in priority order: the explicit
+    /// `stremiox.trailerLanguage` picker first (D11) when set, then the pinned app UI language (reduced to its
+    /// base language code, so "pt-BR" -> "pt", "zh-Hans" -> "zh"), then the preferred AUDIO languages, then the
+    /// device languages. Deduped, lowercased. Empty only when nothing resolves (then the trailer pick falls
+    /// back to original-language/English/first). Shared by the iOS/Mac "watch trailer" callers so the language
+    /// pick is consistent, and by the D11 fallback chain user-lang -> English -> original/any.
+    static var preferredTrailerLanguages: [String] {
+        var out: [String] = []
+        var seen = Set<String>()
+        func add(_ raw: String?) {
+            guard let raw, !raw.isEmpty else { return }
+            let base = Locale(identifier: raw).language.languageCode?.identifier ?? String(raw.prefix(2))
+            let code = base.lowercased()
+            guard !code.isEmpty, seen.insert(code).inserted else { return }
+            out.append(code)
+        }
+        add(trailerLanguageOverride)   // D11: explicit picker wins when set (else UI language, below, is the default)
+        add(AppLanguage.current)
+        for c in TrackPreferences.current.audioLanguages { add(c) }
+        for c in TrackPreferences.deviceLanguages { add(c) }
+        return out
+    }
+
+    /// The single base trailer-language code (ISO-639-1) to hint the `/yt` resolver with (`?lang=`), matching
+    /// the language the app used to pick the YouTube id: the explicit `stremiox.trailerLanguage` picker when
+    /// set (D11), else the resolved app UI language base code. Never empty. Shared by iOS/Mac + tvOS so the
+    /// resolver hint is consistent with the client-side pick (fallback chain user-lang -> en -> original/any is
+    /// enforced resolver-side).
+    static var trailerLanguageBaseCode: String {
+        if let override = trailerLanguageOverride {
+            let base = Locale(identifier: override).language.languageCode?.identifier ?? String(override.prefix(2))
+            if !base.isEmpty { return base.lowercased() }
+        }
+        return LocalizedMetadataLanguage.baseCode
     }
 
     /// CLEAN landscape artwork for the cinematic cards: a textless 16:9 backdrop + a PNG clearlogo from
@@ -538,6 +657,49 @@ enum TMDBClient {
         return "$\(value)"
     }
 
+    // MARK: - Spoken languages (audio-claim verification)
+
+    /// The ISO-639-1 language codes TMDB lists as SPOKEN in a title (movie or TV), lowercased. This is the
+    /// authoritative "which languages does this film's audio actually contain" signal used to VERIFY a
+    /// release-name audio claim before it is shown as a confident language chip: a K-drama whose release name
+    /// says "English" but whose real audio is Korean-only has `spoken_languages` == [ko], so the false EN
+    /// claim can be dropped.
+    ///
+    /// Resolved from an IMDb id through the SAME keyless, cached edge path every other TMDB call uses
+    /// (`get` -> `catalogs.vortx.tv/3` when the user has no key, TMDB direct when they do), so it needs no user
+    /// key. Fail-soft: returns nil (NOT an empty set) on no id / no match / no data / any error, so the caller
+    /// can distinguish "TMDB says the spoken set is X" from "TMDB was unreachable" and only DROP a claim on the
+    /// former. Codes only; no user data.
+    static func spokenLanguages(imdbID: String, type: String) async -> Set<String>? {
+        guard imdbID.hasPrefix("tt") else { return nil }
+        let key = ApiKeys.effectiveTMDBKey()
+        let media = (type == "series") ? "tv" : "movie"
+        guard let found = await get("/find/\(imdbID)?external_source=imdb_id&api_key=\(key)"),
+              let first = (found[media == "tv" ? "tv_results" : "movie_results"] as? [[String: Any]])?.first,
+              let tmdbID = first["id"] as? Int,
+              let details = await get("/\(media)/\(tmdbID)?api_key=\(key)") else { return nil }
+        // `spoken_languages` is [{ iso_639_1, english_name, name }, ...]. Missing/empty -> nil (no signal, do
+        // not treat as "contradicts everything"), never [] (which would falsely contradict every audio claim).
+        guard let langs = details["spoken_languages"] as? [[String: Any]] else { return nil }
+        let codes = langs.compactMap { ($0["iso_639_1"] as? String)?.lowercased() }
+            .filter { !$0.isEmpty && $0 != "xx" }   // TMDB uses "xx" for "no linguistic content"
+        // Fold in original_language too: some titles carry a bare original_language but an empty
+        // spoken_languages, and the original language is genuinely spoken.
+        var set = Set(codes)
+        if let orig = (first["original_language"] as? String)?.lowercased(), !orig.isEmpty, orig != "xx" {
+            set.insert(orig)
+        }
+        guard !set.isEmpty else { return nil }
+        return set
+    }
+
+    /// Optional-id convenience so a caller can `async let` the spoken-languages fetch without wrapping the
+    /// optional in a non-async `.map` (which won't type-check around an async call). nil id -> nil result.
+    static func spokenLanguages(imdbID: String?, type: String) async -> Set<String>? {
+        guard let imdbID else { return nil }
+        return await spokenLanguages(imdbID: imdbID, type: type)
+    }
+
     // MARK: - Movie release dates (theatrical + digital)
 
     struct ReleaseDates: Hashable { let theatrical: String?; let digital: String? }
@@ -586,9 +748,56 @@ enum TMDBClient {
         return out.string(from: date)
     }
 
+    // MARK: - Cast & crew credits (full cast, who-played-who)
+
+    /// One cast entry for the detail page's full-cast rail: the person, the character they played, and a
+    /// w185 headshot URL when TMDB has one. Identifiable by the TMDB person id.
+    struct CastMember: Identifiable, Hashable {
+        let id: Int
+        let name: String
+        let character: String?
+        let profileURL: String?
+    }
+
+    struct CreditsResult: Hashable { let cast: [CastMember]; let overview: String? }
+
+    /// Full cast with character names + headshots, resolved from an IMDb id through the SAME keyless
+    /// edge path every other call uses (no user key required). Series use aggregate_credits so recurring
+    /// roles across seasons resolve; movies use /credits. The /find result's overview rides along as a
+    /// description fallback for titles Cinemeta doesn't know yet. Fail-soft: nil on no match / no data /
+    /// any error; an overview with no cast still returns (the fallback synopsis is useful on its own).
+    static func credits(imdbID: String, type: String) async -> CreditsResult? {
+        guard imdbID.hasPrefix("tt") else { return nil }
+        let key = ApiKeys.effectiveTMDBKey()
+        let media = (type == "series") ? "tv" : "movie"
+        guard let found = await get("/find/\(imdbID)?external_source=imdb_id&api_key=\(key)"),
+              let first = (found[media == "tv" ? "tv_results" : "movie_results"] as? [[String: Any]])?.first,
+              let tmdbID = first["id"] as? Int else { return nil }
+        let overview = (first["overview"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+        let path = media == "tv" ? "/tv/\(tmdbID)/aggregate_credits?api_key=\(key)"
+                                 : "/movie/\(tmdbID)/credits?api_key=\(key)"
+        guard let payload = await get(path), let cast = payload["cast"] as? [[String: Any]] else {
+            return overview == nil ? nil : CreditsResult(cast: [], overview: overview)
+        }
+        let members: [CastMember] = cast.compactMap { entry in
+            guard let name = entry["name"] as? String, !name.isEmpty else { return nil }
+            // Movies carry `character`; TV aggregate credits carry `roles: [{ character }]`.
+            let character = (entry["character"] as? String)
+                ?? ((entry["roles"] as? [[String: Any]])?.first?["character"] as? String)
+            let profile = (entry["profile_path"] as? String).map { "https://image.tmdb.org/t/p/w185\($0)" }
+            return CastMember(id: entry["id"] as? Int ?? name.hashValue, name: name,
+                              character: character.flatMap { $0.isEmpty ? nil : $0 },
+                              profileURL: profile)
+        }
+        return CreditsResult(cast: members, overview: overview)
+    }
+
     /// VortX's keyless catalog edge: a cached, app-gated TMDB proxy that injects OUR key server-side, so
-    /// users with no TMDB key still get the hub. Path here mirrors TMDB's /3 namespace.
-    private static let edgeBase = "https://catalogs.vortx.tv/3"
+    /// users with no TMDB key still get the hub. Path here mirrors TMDB's /3 namespace. Sourced from the
+    /// RemoteConfig `endpoints.catalogs` dial (validated https + *.vortx.tv host, else baked default), so the
+    /// owner can repoint the catalog edge with no app update. Baked default `https://catalogs.vortx.tv/3` ==
+    /// the shipping value; a null/invalid remote endpoint keeps that default.
+    private static var edgeBase: String { RemoteConfig.snapshot.catalogsEndpoint.absoluteString }
 
     /// Single fetch choke point. ROUTE by whether the user supplied their OWN TMDB key:
     ///   - user key present -> talk to TMDB directly (the path already carries their key);
@@ -628,4 +837,32 @@ enum TMDBClient {
             return (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
         } catch { return nil }
     }
+
+    /// Resolve a catalog id to an IMDb `tt` id. A `tt` id passes straight through; a `tmdb:<n>` (or bare
+    /// numeric) id is resolved via /external_ids through the SAME keyless, edge-cached choke point as every
+    /// other call here (catalogs.vortx.tv caches external_ids ~24h with SWR, so a warm title resolves in a few
+    /// ms). Hub catalogs (Discover/Trending/genres/streaming tiles) deliver tmdb: ids, but Cinemeta meta,
+    /// stream add-ons and the ratings service all key on the imdb `tt` id - so resolving BEFORE pushing detail
+    /// is what makes hub items show art/ratings/sources on iOS+Mac the way tvOS already does. The hub type
+    /// guess is sometimes wrong, so try the guessed media then the other; external_ids is authoritative.
+    /// Fail-soft: returns nil on any failure, and the caller falls back to pushing the unresolved id.
+    static func imdbID(forCatalogID cid: String, type: String) async -> String? {
+        if cid.hasPrefix("tt") { return cid }
+        let tmdbNumber: Int?
+        if cid.hasPrefix("tmdb:") { tmdbNumber = Int(cid.dropFirst(5)) }
+        else if let n = Int(cid) { tmdbNumber = n }
+        else { tmdbNumber = nil }
+        guard let tid = tmdbNumber else { return nil }
+        let key = ApiKeys.effectiveTMDBKey()
+        let primary = (type == "series") ? "tv" : "movie"
+        let secondary = (primary == "tv") ? "movie" : "tv"
+        for media in [primary, secondary] {
+            if let ext = await get("/\(media)/\(tid)/external_ids?api_key=\(key)"),
+               let imdb = ext["imdb_id"] as? String, imdb.hasPrefix("tt") {
+                return imdb
+            }
+        }
+        return nil
+    }
+
 }

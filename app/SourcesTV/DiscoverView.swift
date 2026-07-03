@@ -27,6 +27,7 @@ struct DiscoverView: View {
                 BrowseHeroBackdrop(model: focusModel, detailsBottom: 520)
                 ScrollView {
                     VStack(alignment: .leading, spacing: Theme.Space.md) {
+                        Color.clear.frame(height: 0).scrollToTopAnchor()   // re-select Discover tab -> scroll here
                         Text("Discover").screenTitleStyle().padding(.horizontal, Theme.Space.screenEdge)
                         if showCollectionsHub, CollectionsHubModel.isAvailable {
                             TVCollectionsHub(model: collectionsHub)
@@ -47,6 +48,8 @@ struct DiscoverView: View {
                     .padding(.bottom, Theme.Space.xl)
                 }
                 .heroBottomStrip()
+                // Re-selecting the active Discover tab scrolls back to the top.
+                .scrollToTopOnBump(TabScrollKeys.discover)
             }
             .background(Theme.Palette.canvas.ignoresSafeArea())
         }

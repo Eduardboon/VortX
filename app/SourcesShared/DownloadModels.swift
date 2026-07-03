@@ -62,8 +62,17 @@ struct DownloadRecord: Codable, Identifiable, Hashable {
     let remoteURL: String
 
     /// On-disk filename (`<id>.<ext>`), relative to the Downloads directory. The full `URL` is rebuilt
-    /// from the current container path so a relocated container can't strand the file.
+    /// from the current container path so a relocated container can't strand the file. Unused for an HLS
+    /// offline download (those live in a system-managed `.movpkg`, tracked by `hlsRelativePath` instead).
     let localFilename: String
+
+    /// HLS offline downloads (iOS only, via `AVAssetDownloadTask`) land in a system-managed `.movpkg`
+    /// bundle whose path we do not choose; we persist its path RELATIVE to the home directory (the
+    /// container UUID can change between launches) and rebuild the absolute URL on demand. Non-nil only
+    /// for a COMPLETED HLS download; nil for a progressive/torrent file download and for an in-flight HLS
+    /// download (which is identified by its `.m3u8` `remoteURL` until it finishes). Its presence is what
+    /// routes offline playback through AVPlayer instead of libmpv (libmpv can't open a `.movpkg`).
+    var hlsRelativePath: String?
 
     var bytesTotal: Int64
     var bytesDone: Int64
@@ -72,9 +81,13 @@ struct DownloadRecord: Codable, Identifiable, Hashable {
     /// Human-readable failure reason when `state == .failed`; nil otherwise.
     var errorText: String?
 
+    /// A completed HLS offline download (its media is a `.movpkg`, playable only by AVPlayer).
+    var isHLSOffline: Bool { hlsRelativePath != nil }
+
     init(id: UUID = UUID(), contentId: String, videoId: String, type: String, name: String,
          poster: String?, season: Int?, episode: Int?, sourceName: String?, qualityText: String?,
          isTorrent: Bool, headers: [String: String]?, remoteURL: String, localFilename: String,
+         hlsRelativePath: String? = nil,
          bytesTotal: Int64 = 0, bytesDone: Int64 = 0, state: DownloadState = .queued,
          addedAt: Date = Date(), errorText: String? = nil) {
         self.id = id
@@ -91,6 +104,7 @@ struct DownloadRecord: Codable, Identifiable, Hashable {
         self.headers = headers
         self.remoteURL = remoteURL
         self.localFilename = localFilename
+        self.hlsRelativePath = hlsRelativePath
         self.bytesTotal = bytesTotal
         self.bytesDone = bytesDone
         self.state = state

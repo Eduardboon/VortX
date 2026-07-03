@@ -145,6 +145,12 @@ struct StremioXiOSApp: App {
                 // insert into. Combined with .windowStyle(.hiddenTitleBar) below this removes the
                 // toolbar OBJECT the NSToolbar-insert crash requires, not just each item source.
                 .toolbar(.hidden, for: .windowToolbar)
+                // Traffic lights: hiddenTitleBar + the hidden window toolbar can leave the close /
+                // minimize / zoom buttons hidden with the collapsed titlebar host. This accessor keeps
+                // `.titled` in the styleMask and explicitly unhides the three standard buttons (and
+                // their container) so they float over the top-left of the full-size content, with NO
+                // NSToolbar ever attached.
+                .background(MacWindowChrome())
                 #endif
         }
         // macOS opens the window at a real default size (the deployment target is macOS 14, so
@@ -153,8 +159,13 @@ struct StremioXiOSApp: App {
         #if os(macOS)
         .defaultSize(width: 1280, height: 820)
         .windowResizability(.contentMinSize)
-        // AppKit never stands up a titlebar/toolbar at window creation, so the shared NSToolbar
-        // the crash inserts into is never created. (macOS 14 target, so .hiddenTitleBar is available.)
+        // `.hiddenTitleBar` is LOAD-BEARING for the NSToolbar crash: AppKit never stands up the
+        // titlebar/toolbar host at window creation, so `_insertNewItemWithItemIdentifier` has nothing
+        // to insert into even when SwiftUI's toolbar bridge (e.g. a NavigationStack back button across
+        // the seven simultaneously-mounted stacks) publishes items. Build 145 switched this to
+        // `.titleBar` to restore the traffic lights and the crash came straight back; the buttons are
+        // instead restored by MacWindowChrome below, which keeps `.titled` in the styleMask and unhides
+        // the standard window buttons over the full-size content. Never switch back to `.titleBar`.
         .windowStyle(.hiddenTitleBar)
         .commands {
             // Single-window media app: the document-style File ▸ New does nothing here, so drop it.
@@ -199,6 +210,140 @@ enum MacCommands {
         NotificationCenter.default.post(name: tabRequest, object: nil, userInfo: ["tab": destination.rawValue])
     }
 }
+
+#if os(macOS)
+import AppKit
+
+/// Hands a query typed in the persistent macOS top bar (iOSRootView.macTopBar) to whichever screen
+/// hosts the engine search (the Search tab, or Discover in merged mode). A `@Published` value, not a
+/// notification, because the target screen may be LAZILY mounted on its first visit: the mount happens
+/// a render after the tab switch, and `onReceive` of a published value still delivers the pending query
+/// to the newly-mounted screen, where a notification posted pre-mount would be lost.
+@MainActor
+final class MacSearchBridge: ObservableObject {
+    static let shared = MacSearchBridge()
+    private init() {}
+    /// The query awaiting consumption; the consuming screen runs it and resets this to nil.
+    @Published var pending: String?
+}
+
+/// Restores the traffic-light buttons on the `.hiddenTitleBar` window. The hiddenTitleBar style (plus
+/// the hidden window toolbar) is what keeps the NSToolbar-insert crash dead, but it can leave the
+/// close/minimize/zoom buttons hidden along with the collapsed titlebar host, the owner's "no window
+/// buttons" report. This keeps `.titled` in the styleMask and unhides the three standard buttons (and
+/// their container view) so they float over the full-size content, without ever attaching an NSToolbar.
+private struct MacWindowChrome: NSViewRepresentable {
+    func makeNSView(context: Context) -> NSView {
+        let view = NSView(frame: .zero)
+        // The window isn't attached yet; defer one runloop turn to find + configure it.
+        DispatchQueue.main.async { [weak view, coordinator = context.coordinator] in
+            coordinator.attach(to: view?.window)
+        }
+        return view
+    }
+
+    func updateNSView(_ nsView: NSView, context: Context) {
+        // Re-assert on SwiftUI passes so a late chrome update (player overlay up/down, scene phase
+        // churn) can never leave the buttons hidden again.
+        DispatchQueue.main.async { [weak nsView, coordinator = context.coordinator] in
+            coordinator.attach(to: nsView?.window)
+        }
+    }
+
+    func makeCoordinator() -> Coordinator { Coordinator() }
+
+    /// One-shot asyncs lose the race: SwiftUI's toolbar bridge re-collapses the titlebar host on later
+    /// preference passes (every NavigationStack push), so the buttons vanished again after the initial
+    /// unhide. The coordinator owns a long-lived `didUpdate` observer that re-asserts with a cheap
+    /// early-exit, so any re-hide self-heals within one window update cycle.
+    final class Coordinator {
+        private var observed: NSWindow?
+        private var token: NSObjectProtocol?
+
+        deinit { if let token { NotificationCenter.default.removeObserver(token) } }
+
+        func attach(to window: NSWindow?) {
+            guard let window else { return }
+            Self.apply(to: window)
+            Self.probe(window)
+            guard observed !== window else { return }
+            if let token { NotificationCenter.default.removeObserver(token) }
+            observed = window
+            token = NotificationCenter.default.addObserver(
+                forName: NSWindow.didUpdateNotification, object: window, queue: .main
+            ) { note in
+                Self.apply(to: note.object as? NSWindow)
+            }
+            // Belt and braces for the first seconds while SwiftUI settles its toolbar/titlebar state.
+            for delay in [0.2, 1.0, 3.0] {
+                DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak window] in
+                    Self.apply(to: window)
+                    Self.probe(window)
+                }
+            }
+        }
+
+        /// Temporary field diagnostic for the owner's "no traffic lights" report: dumps the true AppKit
+        /// state of the three standard buttons + their titlebar chain to the unified log.
+        private static func probe(_ window: NSWindow?) {
+            guard let window else { return }
+            var lines = ["styleMask=\(window.styleMask.rawValue) titleVis=\(window.titleVisibility.rawValue) transparent=\(window.titlebarAppearsTransparent)"]
+            for kind: NSWindow.ButtonType in [.closeButton, .miniaturizeButton, .zoomButton] {
+                guard let b = window.standardWindowButton(kind) else {
+                    lines.append("btn \(kind.rawValue): NIL"); continue
+                }
+                var chain = "btn \(kind.rawValue): hidden=\(b.isHidden) alpha=\(b.alphaValue) frame=\(NSStringFromRect(b.frame))"
+                var v: NSView? = b.superview
+                var depth = 0
+                while let s = v, depth < 3 {
+                    chain += " | sup\(depth)[\(type(of: s))] hidden=\(s.isHidden) alpha=\(s.alphaValue) frame=\(NSStringFromRect(s.frame))"
+                    v = s.superview; depth += 1
+                }
+                lines.append(chain)
+            }
+            NSLog("[macchrome] %@", lines.joined(separator: "\n"))
+        }
+
+        private static func apply(to window: NSWindow?) {
+            guard let window else { return }
+            // Cheap early-exit so the didUpdate observer costs nothing once the chrome is right.
+            if let close = window.standardWindowButton(.closeButton),
+               !close.isHidden, close.alphaValue >= 1,
+               close.superview?.isHidden == false, (close.superview?.alphaValue ?? 0) >= 1,
+               close.superview?.superview?.isHidden == false,
+               (close.superview?.superview?.alphaValue ?? 0) >= 1,
+               window.styleMask.contains(.titled) { return }
+            // Guarded union: reassigning styleMask when nothing is missing once collapsed the window to
+            // its minimum size (see MacPlayerChromeHider's note), so only touch it when a flag is absent.
+            let needed: NSWindow.StyleMask = [.titled, .closable, .miniaturizable, .resizable]
+            if !window.styleMask.isSuperset(of: needed) { window.styleMask.formUnion(needed) }
+            window.titleVisibility = .hidden
+            window.titlebarAppearsTransparent = true
+            for kind: NSWindow.ButtonType in [.closeButton, .miniaturizeButton, .zoomButton] {
+                guard let button = window.standardWindowButton(kind) else { continue }
+                button.isHidden = false
+                // Unhide the WHOLE titlebar chain: NSTitlebarView and NSTitlebarContainerView can each
+                // be the hidden/collapsed node when the window toolbar resolves hidden. A zero-height
+                // container never draws either, so give a collapsed node a real titlebar height back.
+                var node: NSView? = button.superview
+                while let v = node, v !== window.contentView?.superview {
+                    v.isHidden = false
+                    // SwiftUI's hidden-toolbar resolution FADES NSTitlebarContainerView to alpha 0
+                    // rather than hiding it (field-verified: hidden=false, alpha=0.0) — restore alpha
+                    // or the unhidden buttons still never draw.
+                    if v.alphaValue < 1 { v.alphaValue = 1 }
+                    if v.frame.height < 1 {
+                        var f = v.frame
+                        f.size.height = 28
+                        v.frame = f
+                    }
+                    node = v.superview
+                }
+            }
+        }
+    }
+}
+#endif
 
 #if os(macOS) && !STREMIOX_NO_EMBEDDED_SERVER
 import AppKit

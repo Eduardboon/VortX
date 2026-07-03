@@ -1,4 +1,5 @@
 import Foundation
+import CryptoKit
 import Metal
 import ImageIO
 #if canImport(UIKit)
@@ -49,6 +50,10 @@ final class MPVMetalViewController: PlatformViewController {
     var playUrl: URL?
     var playHeaders: [String: String]?
     var playUrlLive = false
+    /// yt-direct adaptive pair: an EXTERNAL AUDIO stream mounted alongside `playUrl` at load (mpv
+    /// `--audio-files`). Set BEFORE viewDidLoad by MPVMetalPlayerView when a trailer resolved to a
+    /// video-only adaptive stream + separate audio; nil (the normal case) changes nothing.
+    var playAudioSidecarURL: URL?
     var onSingleTap: (() -> Void)?
     var hdrAvailable : Bool = false
     /// Hero-preview only (#44): start muted with no audio output and loop the file forever. Set BEFORE
@@ -104,7 +109,7 @@ final class MPVMetalViewController: PlatformViewController {
         setupMpv()
         
         if let url = playUrl {
-            loadFile(url, headers: playHeaders, live: playUrlLive)
+            loadFile(url, headers: playHeaders, live: playUrlLive, audioSidecar: playAudioSidecarURL)
         }
     }
     
@@ -568,6 +573,7 @@ final class MPVMetalViewController: PlatformViewController {
         mpv_observe_property(mpv, 0, MPVProperty.timePos, MPV_FORMAT_DOUBLE)
         mpv_observe_property(mpv, 0, MPVProperty.duration, MPV_FORMAT_DOUBLE)
         mpv_observe_property(mpv, 0, MPVProperty.seekable, MPV_FORMAT_FLAG)
+        mpv_observe_property(mpv, 0, MPVProperty.demuxerCacheTime, MPV_FORMAT_DOUBLE)
         mpv_observe_property(mpv, 0, MPVProperty.pause, MPV_FORMAT_FLAG)
         mpv_observe_property(mpv, 0, MPVProperty.trackList, MPV_FORMAT_NONE)
         // mpv gets a retained relay holding a WEAK controller reference, never the controller
@@ -739,7 +745,8 @@ final class MPVMetalViewController: PlatformViewController {
     func loadFile(
         _ url: URL,
         headers: [String: String]? = nil,
-        live: Bool = false
+        live: Bool = false,
+        audioSidecar: URL? = nil
     ) {
         // Re-arm HDR detection for THIS file. appliedDynamicRange otherwise persists from the previous
         // file, so an in-place episode / source switch left it stale and the guard SKIPPED re-applying the
@@ -774,6 +781,16 @@ final class MPVMetalViewController: PlatformViewController {
         setString("user-agent", userAgent.isEmpty ? defaultUserAgent : userAgent)
         setString("referrer", referrer)
         setString("http-header-fields", fields.joined(separator: ","))
+
+        // yt-direct adaptive pair: mount the external audio stream so mpv merges it with the video-only
+        // file at load (`--audio-files`, applied per file at load time). ALWAYS clear first so a previous
+        // trailer's sidecar never bleeds into the next stream (same hygiene as the headers above).
+        // `change-list append` hands the URL to mpv as ONE argument: setting the property as a string
+        // would re-parse it against the path-list separator (":"), which every https URL contains.
+        command("change-list", args: ["audio-files", "clr", ""])
+        if let audioSidecar {
+            command("change-list", args: ["audio-files", "append", audioSidecar.absoluteString])
+        }
 
         // Size the read-ahead by where the bytes come from. A torrent plays from the embedded server
         // on 127.0.0.1, which already buffers the file into its OWN disk cache, so a 512 MiB mpv
@@ -814,18 +831,25 @@ final class MPVMetalViewController: PlatformViewController {
         // bitrate or whether cache-on-disk offloads. (A LOCAL torrent buffers into the embedded server's
         // own disk cache, and live owns its tight buffers, so those keep the RAM-safe read-ahead above.)
         if DiskCacheSetting.diskCacheEnabled, !live, !isLocalStream {
-            #if os(macOS)
-            let ramCeiling: Int64 = 1_024 * 1024 * 1024   // Mac: out-of-process server + swap, generous
-            #else
             // DEVICE-SOAK ITEM: the prior flat 256 MiB ceiling masked the Settings slider and starved the
             // read-ahead to ~25-30s on debrid (the owner had 120-200s before). The ATV 4K (4 GB + memory
             // entitlement) holds ~75-90s at 4K within 768 MiB, ~3x runway, which also resolves the lag and
             // ~7 dropped frames (the buffer was draining on CDN dips). 768 MiB is deliberately BELOW the
-            // ~700 MB+ unclamped level that jetsam-killed the device; keep ATV HD (reduced) tight at 128 MiB.
+            // ~700 MB+ unclamped level that jetsam-killed the device; keep ATV HD (reduced) tight at 128 MiB;
+            // the Mac (out-of-process server + swap) gets the generous 1 GiB ceiling.
             // The player-teardown straddle that caused the earlier whole-device hang is fixed separately, so
             // this is the buffer's first real restore. If it jetsams on soak, step 768 -> 512 MiB.
-            let ramCeiling: Int64 = PerformanceMode.reduced ? 128 * 1024 * 1024 : 768 * 1024 * 1024
+            //
+            // THE RECURRING JETSAM KNOB: these ceilings are now the RemoteConfig `player.readAhead.*` dials
+            // (debrid 64..900, reduced 64..192, mac 128..1536, floor fixed 64). Baked fallbacks (768/128/1024)
+            // equal the shipping literals, so a null / absent remote config is behaviorally identical to today;
+            // a bad value clamps to the baked default and can never breach the jetsam-safe range.
+            #if os(macOS)
+            let isMac = true
+            #else
+            let isMac = false
             #endif
+            let ramCeiling = Int64(RemoteConfig.snapshot.readAheadDebridCeilingBytes(reduced: PerformanceMode.reduced, isMac: isMac))
             let applied = min(DiskCacheSetting.resolvedMaxBytes(), ramCeiling)
             mpv_set_property_string(mpv, "demuxer-max-bytes", String(applied))
         } else {
@@ -839,7 +863,7 @@ final class MPVMetalViewController: PlatformViewController {
         // Log only scheme://host/path: debrid and direct-CDN URLs carry API tokens / signed queries in the
         // userinfo and query string, which must not land in the device's persistent unified log.
         let redactedURL = "\(url.scheme ?? "?")://\(url.host ?? "?")\(url.path)"
-        mpvLog.log("loadFile → \(redactedURL, privacy: .public)")
+        mpvLog.log("loadFile → \(redactedURL, privacy: .public)\(audioSidecar != nil ? " (+audio sidecar)" : "", privacy: .public)")
         command("loadfile", args: args)
     }
 
@@ -1060,6 +1084,47 @@ final class MPVMetalViewController: PlatformViewController {
     func setAudioTrack(_ id: Int) { setString(MPVProperty.aid, id < 0 ? "no" : String(id)) }
     func setSubtitleTrack(_ id: Int) { setString(MPVProperty.sid, id < 0 ? "no" : String(id)) }
 
+    /// Session-lived map of add-on subtitle URL -> already-downloaded LOCAL file. Once a subtitle has been
+    /// fetched, re-selecting that track or re-opening the same episode hands the on-disk file straight to mpv
+    /// with NO network (see below), so it loads instantly instead of re-downloading from scratch every time.
+    /// Guarded by `subtitleCacheLock`; keyed by the remote URL. Static so it survives player teardown within a
+    /// session (re-opening an episode makes a fresh controller).
+    private static var subtitleFileCache: [URL: URL] = [:]
+    /// Insertion order for `subtitleFileCache`, so a long binge that samples many distinct subtitle URLs evicts
+    /// the oldest entry past the cap instead of growing the map unbounded for the whole process lifetime.
+    private static var subtitleCacheOrder: [URL] = []
+    private static let subtitleCacheCap = 256
+    private static let subtitleCacheLock = NSLock()
+
+    /// Record `remote -> local` under the cap, evicting the oldest entry (FIFO) when full. Caller must NOT hold
+    /// `subtitleCacheLock`; this takes it.
+    private static func rememberSubtitleFile(_ remote: URL, _ local: URL) {
+        subtitleCacheLock.lock(); defer { subtitleCacheLock.unlock() }
+        if subtitleFileCache[remote] == nil {
+            subtitleCacheOrder.append(remote)
+            while subtitleCacheOrder.count > subtitleCacheCap {
+                let oldest = subtitleCacheOrder.removeFirst()
+                subtitleFileCache[oldest] = nil
+            }
+        }
+        subtitleFileCache[remote] = local
+    }
+
+    /// Shared URLSession with a small on-disk/in-memory URLCache so cacheable provider responses are reused
+    /// across picks even before our own file cache is populated. A few MB is plenty for text subtitles.
+    private static let subtitleSession: URLSession = {
+        let config = URLSessionConfiguration.default
+        config.urlCache = URLCache(memoryCapacity: 2 * 1024 * 1024, diskCapacity: 8 * 1024 * 1024, diskPath: "stremiox-subs")
+        config.requestCachePolicy = .returnCacheDataElseLoad
+        return URLSession(configuration: config)
+    }()
+
+    /// Per-pick network timeout and retry count for subtitle downloads. Hardcoded constants for now (a later
+    /// pass may move these to RemoteConfig); 12s is snappy without giving up on a slow-but-alive provider, and
+    /// ONE retry rescues a transient timeout / flaky first connection.
+    private static let subtitleDownloadTimeout: TimeInterval = 12
+    private static let subtitleDownloadRetries = 1
+
     /// Load an external subtitle from a (possibly slow) add-on URL WITHOUT blocking the caller, then
     /// select it. The old form ran `sub-add <remoteURL>` straight through `mpv_command`, which downloads
     /// the file INLINE on the calling thread; called from the subtitles panel on the main thread, a slow
@@ -1067,25 +1132,71 @@ final class MPVMetalViewController: PlatformViewController {
     /// whole app for the entire fetch. Instead we download the file ourselves on a background queue with a
     /// timeout, then `sub-add` the LOCAL file on the mpv queue (no network, instant). `completion` runs on
     /// the main thread with whether the subtitle loaded, so the UI can show progress and surface failures.
+    ///
+    /// Fast path: if we already downloaded this URL this session and the file is still on disk, we `sub-add`
+    /// it immediately with NO network, so re-selecting a track / re-opening an episode is instant.
     func addExternalSubtitle(url: String, title: String, lang: String,
-                             timeout: TimeInterval = 20, completion: ((Bool) -> Void)? = nil) {
+                             timeout: TimeInterval = MPVMetalViewController.subtitleDownloadTimeout,
+                             completion: ((Bool) -> Void)? = nil) {
         guard let remote = URL(string: url) else { completion?(false); return }
         let finish: (Bool) -> Void = { ok in DispatchQueue.main.async { completion?(ok) } }
-        var request = URLRequest(url: remote)
-        request.timeoutInterval = timeout
-        URLSession.shared.dataTask(with: request) { [weak self] data, response, _ in
-            guard let self else { return }
-            let statusOK = (response as? HTTPURLResponse).map { (200 ..< 400).contains($0.statusCode) } ?? true
-            guard statusOK, let data, !data.isEmpty else { finish(false); return }
-            let ext = Self.subtitleExtension(for: remote,
-                                             contentType: (response as? HTTPURLResponse)?.value(forHTTPHeaderField: "Content-Type"))
-            let tmp = FileManager.default.temporaryDirectory
-                .appendingPathComponent("stremiox-sub-\(UUID().uuidString).\(ext)")
-            guard (try? data.write(to: tmp)) != nil else { finish(false); return }
+
+        // Fast path: reuse a previously downloaded file if it's still on disk (no network).
+        if let cached = Self.cachedSubtitleFile(for: remote) {
             self.queue.async {
-                self.command("sub-add", args: [tmp.path, "select", title, lang])   // local file: no network, off-main
+                self.command("sub-add", args: [cached.path, "select", title, lang])
                 finish(true)
             }
+            return
+        }
+
+        Self.downloadSubtitle(remote, timeout: timeout, retriesLeft: Self.subtitleDownloadRetries) { [weak self] localFile in
+            guard let self, let localFile else { finish(false); return }
+            self.queue.async {
+                self.command("sub-add", args: [localFile.path, "select", title, lang])   // local file: no network, off-main
+                finish(true)
+            }
+        }
+    }
+
+    /// Return the cached local file for `remote` only if it was recorded this session AND still exists on
+    /// disk; otherwise drop the stale entry and return nil so the caller re-downloads. Thread-safe.
+    private static func cachedSubtitleFile(for remote: URL) -> URL? {
+        subtitleCacheLock.lock(); defer { subtitleCacheLock.unlock() }
+        guard let file = subtitleFileCache[remote] else { return nil }
+        if FileManager.default.fileExists(atPath: file.path) { return file }
+        subtitleFileCache[remote] = nil   // file was purged (e.g. temp cleanup); force a re-download
+        subtitleCacheOrder.removeAll { $0 == remote }
+        return nil
+    }
+
+    /// Download `remote` on the shared cached session, write it to a DETERMINISTIC temp file (hashed from the
+    /// URL, so it survives and is reused across the session), record it in the cache, and hand the local file
+    /// to `done` on failure/success. Retries ONCE on a failed/empty/timed-out response before giving up.
+    private static func downloadSubtitle(_ remote: URL, timeout: TimeInterval, retriesLeft: Int,
+                                         done: @escaping (URL?) -> Void) {
+        var request = URLRequest(url: remote)
+        request.timeoutInterval = timeout
+        request.cachePolicy = .returnCacheDataElseLoad
+        subtitleSession.dataTask(with: request) { data, response, _ in
+            let statusOK = (response as? HTTPURLResponse).map { (200 ..< 400).contains($0.statusCode) } ?? true
+            guard statusOK, let data, !data.isEmpty else {
+                if retriesLeft > 0 {
+                    downloadSubtitle(remote, timeout: timeout, retriesLeft: retriesLeft - 1, done: done)
+                } else { done(nil) }
+                return
+            }
+            let ext = subtitleExtension(for: remote,
+                                        contentType: (response as? HTTPURLResponse)?.value(forHTTPHeaderField: "Content-Type"))
+            // Deterministic, content-addressed filename so the same subtitle reuses one on-disk file all session
+            // AND two distinct URLs never collide onto the same file (a 64-bit `hashValue` gives no such
+            // guarantee, which would let one track's file serve the other's cached entry).
+            let digest = SHA256.hash(data: Data(remote.absoluteString.utf8))
+            let name = "stremiox-sub-\(digest.map { String(format: "%02x", $0) }.joined()).\(ext)"
+            let tmp = FileManager.default.temporaryDirectory.appendingPathComponent(name)
+            guard (try? data.write(to: tmp)) != nil else { done(nil); return }
+            rememberSubtitleFile(remote, tmp)
+            done(tmp)
         }.resume()
     }
 
@@ -1104,6 +1215,23 @@ final class MPVMetalViewController: PlatformViewController {
 
     /// Manual subtitle sync, in seconds (positive = subtitles appear later). Maps to mpv `sub-delay`.
     func setSubDelay(_ seconds: Double) { setString("sub-delay", String(format: "%.2f", seconds)) }
+
+    /// Video frame-rate for the community-subtitle release fingerprint. Prefers the container-declared fps,
+    /// falling back to the estimated video-filter fps; 0 when unknown (the fingerprint tolerates a 0/absent
+    /// value). Read off the player state exactly like the HDR path already reads `container-fps`.
+    func containerFrameRate() -> Double {
+        let container = getDouble("container-fps")
+        if container > 0 { return container }
+        return getDouble("estimated-vf-fps")
+    }
+
+    /// Media runtime in seconds for the community-subtitle release fingerprint (the same `duration` property
+    /// the scrubber/trickplay read). 0 before the file is open.
+    func mediaDurationSeconds() -> Double { getDouble("duration") }
+
+    /// The current subtitle delay in seconds (mpv `sub-delay`), read back so the sync-capture path can pool
+    /// the user's learned offset. 0 when unset / unavailable.
+    func currentSubDelaySeconds() -> Double { getDouble("sub-delay") }
 
     /// Manual audio sync, in seconds. Maps to mpv `audio-delay`.
     func setAudioDelay(_ seconds: Double) { setString("audio-delay", String(format: "%.2f", seconds)) }
@@ -1143,7 +1271,13 @@ final class MPVMetalViewController: PlatformViewController {
 
     /// Apply `videoSizeMode` via `set`, `mpv_set_option_string` before init, `setString` (property)
     /// after, so the mode is realised identically at startup and on every video-output rebuild.
+    /// When true, this instance ALWAYS crops-to-fill regardless of the user's global videoSize setting. Set
+    /// only by the ambient hero trailer clip (#44) so it fills the whole hero band instead of letterboxing in
+    /// a small centered box on iPad/Mac/tvOS. Never set on the main player, so real playback aspect is unchanged.
+    var forceFillVideo = false
+
     private func applyVideoSize(_ set: (String, String) -> Void) {
+        if forceFillVideo { set("keepaspect", "yes"); set("panscan", "1.0"); return }   // ambient hero: fill the band
         switch videoSizeMode {
         case "zoom", "fill": set("keepaspect", "yes"); set("panscan", "1.0")   // crop to fill
         case "stretch":      set("keepaspect", "no");  set("panscan", "0.0")   // distort to fill
@@ -1152,6 +1286,20 @@ final class MPVMetalViewController: PlatformViewController {
     }
 
     func setSpeed(_ speed: Double) { setString(MPVProperty.speed, String(format: "%.2f", speed)) }
+
+    /// Live playback position (mpv `time-pos`), for the wall-clock trickplay capture driver. 0 before the
+    /// first frame or when nothing is open.
+    var playbackPositionSeconds: Double { getDouble("time-pos") }
+
+    /// Live audio volume on mpv's 0...100 scale (`volume` property; 100 = source level). Clamped 0...100.
+    /// Independent of `mute`, so the chrome can restore the level after an unmute.
+    func setVolume(_ volume0to100: Double) {
+        let v = max(0, min(100, volume0to100))
+        setString("volume", String(format: "%.0f", v))
+    }
+
+    /// Mute / unmute the live audio output (mpv `mute`) without disturbing the `volume` level.
+    func setMuted(_ muted: Bool) { setFlag("mute", muted) }
 
     /// Whether VideoToolbox hardware decoding is currently requested (the player's Decoder option).
     private(set) var hardwareDecoding = true
@@ -1324,6 +1472,8 @@ final class MPVMetalViewController: PlatformViewController {
     /// from competing with remote input on the main thread (the player-sluggishness
     /// the audit flagged). Threshold logic in the delegate still fires fine at 4 Hz.
     private var lastTimePosEmit: TimeInterval = 0
+    /// Coalesces the buffered-ahead (`demuxer-cache-time`) emits to ~2 Hz for the grey scrubber band.
+    private var lastCacheTimeEmit: TimeInterval = 0
 
     func readEvents() {
         queue.async { [weak self] in
@@ -1377,6 +1527,16 @@ final class MPVMetalViewController: PlatformViewController {
                         case MPVProperty.seekable:
                             let seekable = UnsafePointer<Bool>(OpaquePointer(property.data))?.pointee ?? true
                             self.emit(propertyName, seekable)
+                        case MPVProperty.demuxerCacheTime:
+                            // Buffered-ahead edge (absolute seconds). mpv fires this often; coalesce to a
+                            // couple of Hz so the grey scrubber band updates smoothly without churn.
+                            if let value = UnsafePointer<Double>(OpaquePointer(property.data))?.pointee {
+                                let now = ProcessInfo.processInfo.systemUptime
+                                if now - self.lastCacheTimeEmit >= 0.5 {
+                                    self.lastCacheTimeEmit = now
+                                    self.emit(propertyName, value)
+                                }
+                            }
                         case MPVProperty.timePos:
                             if let value = UnsafePointer<Double>(OpaquePointer(property.data))?.pointee {
                                 let now = ProcessInfo.processInfo.systemUptime
