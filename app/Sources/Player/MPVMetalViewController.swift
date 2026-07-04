@@ -759,7 +759,13 @@ final class MPVMetalViewController: PlatformViewController {
         // auto-advanced / skipped episodes are washed out" report. (HDR is only verifiable on a real HDR
         // display, not the Simulator.)
         appliedDynamicRange = nil
-        var args = [url.absoluteString]
+        // The URL / audio sidecar mpv actually opens. `url` and `audioSidecar` are `let` params; a googlevideo
+        // trailer swaps these to their local VXTrailerProxy (127.0.0.1) equivalents below, BEFORE they are handed
+        // to mpv via `args` and the `audio-files` append. Everything downstream (args, isLocalStream, the audio
+        // sidecar append, the redacted log) reads these, so the swap flows through the rest of loadFile untouched.
+        var playURL = url
+        var sidecar = audioSidecar
+        var args = [playURL.absoluteString]
         var options = [String]()
 
         args.append("replace")
@@ -782,14 +788,45 @@ final class MPVMetalViewController: PlatformViewController {
         setString("referrer", referrer)
         setString("http-header-fields", fields.joined(separator: ","))
 
+        // yt-direct googlevideo streams no longer play when handed to mpv directly: googlevideo now 403s every
+        // Range shape FFmpeg can send (open-ended `bytes=0-` and no-Range alike), so libmpv reports
+        // `endFileError reason=loading failed` (the "Trailer unavailable" overlay) even with the correct UA.
+        // The proven fix is VXTrailerProxy: a local 127.0.0.1 HTTP range-proxy that answers mpv with a clean 206
+        // and fetches googlevideo in bounded <=1 MiB `&range=` windows (each a plain HTTP 200), sending the
+        // InnerTube IOS-client UA upstream. So DETECT the googlevideo host here and SWAP both the video URL and
+        // the audio sidecar to their proxy (127.0.0.1) equivalents BEFORE mpv opens them; the proxy falls back to
+        // the raw URL (nil) if it cannot start, so playback degrades to the old direct path rather than breaking.
+        // After the swap mpv talks to 127.0.0.1, which the isLocalStream read-ahead branch below already handles.
+        // The UA-force is kept as a harmless fallback: it targets the raw googlevideo host and simply will not
+        // match 127.0.0.1 once proxied. mpv's `user-agent` option applies to EVERY stream this load opens,
+        // including the `--audio-files` sidecar. Non-googlevideo streams are untouched, so debrid/direct/torrent
+        // playback keeps its own UA.
+        let isGoogleVideo = { (u: URL?) in u?.host?.contains("googlevideo") ?? false }
+        if isGoogleVideo(url) || isGoogleVideo(audioSidecar) {
+            if isGoogleVideo(url) {
+                playURL = VXTrailerProxy.shared.proxied(url, mime: "video/mp4") ?? url
+            }
+            if let audioSidecar, isGoogleVideo(audioSidecar) {
+                sidecar = VXTrailerProxy.shared.proxied(audioSidecar, mime: "audio/mp4") ?? audioSidecar
+            }
+            args[0] = playURL.absoluteString
+            setString("user-agent", YouTubeDirectResolver.googlevideoUserAgent)
+            // Referer/extra headers from a browser context would only confuse googlevideo's UA binding.
+            setString("referrer", "")
+            setString("http-header-fields", "")
+            NSLog("[yt-probe] loadFile googlevideo: proxying via 127.0.0.1 playHost=%@ sidecar=%@ applyingUA=%@",
+                  playURL.host ?? "?", sidecar == nil ? "none" : (sidecar!.host ?? "?"),
+                  YouTubeDirectResolver.googlevideoUserAgent)
+        }
+
         // yt-direct adaptive pair: mount the external audio stream so mpv merges it with the video-only
         // file at load (`--audio-files`, applied per file at load time). ALWAYS clear first so a previous
         // trailer's sidecar never bleeds into the next stream (same hygiene as the headers above).
         // `change-list append` hands the URL to mpv as ONE argument: setting the property as a string
         // would re-parse it against the path-list separator (":"), which every https URL contains.
         command("change-list", args: ["audio-files", "clr", ""])
-        if let audioSidecar {
-            command("change-list", args: ["audio-files", "append", audioSidecar.absoluteString])
+        if let sidecar {
+            command("change-list", args: ["audio-files", "append", sidecar.absoluteString])
         }
 
         // Size the read-ahead by where the bytes come from. A torrent plays from the embedded server
@@ -799,8 +836,8 @@ final class MPVMetalViewController: PlatformViewController {
         // 161 -> 499 MB and still rising) until tvOS jetsam-killed the app -- the "server died" with the
         // torrent still playing. So a LOCAL (torrent) stream gets a small read-ahead; a remote debrid or
         // direct CDN keeps the full buffer for network resilience. Set per file at runtime.
-        let isLocalStream = url.host == "127.0.0.1" || url.host == "localhost"
-            || (url.host?.hasSuffix("strem.io") ?? false)
+        let isLocalStream = playURL.host == "127.0.0.1" || playURL.host == "localhost"
+            || (playURL.host?.hasSuffix("strem.io") ?? false)
         configureLiveMode(live)
         let readAhead: String
         if live {
@@ -862,8 +899,8 @@ final class MPVMetalViewController: PlatformViewController {
 
         // Log only scheme://host/path: debrid and direct-CDN URLs carry API tokens / signed queries in the
         // userinfo and query string, which must not land in the device's persistent unified log.
-        let redactedURL = "\(url.scheme ?? "?")://\(url.host ?? "?")\(url.path)"
-        mpvLog.log("loadFile → \(redactedURL, privacy: .public)\(audioSidecar != nil ? " (+audio sidecar)" : "", privacy: .public)")
+        let redactedURL = "\(playURL.scheme ?? "?")://\(playURL.host ?? "?")\(playURL.path)"
+        mpvLog.log("loadFile → \(redactedURL, privacy: .public)\(sidecar != nil ? " (+audio sidecar)" : "", privacy: .public)")
         command("loadfile", args: args)
     }
 
@@ -1519,9 +1556,12 @@ final class MPVMetalViewController: PlatformViewController {
                             }
                         case MPVProperty.pausedForCache:
                             let buffering = UnsafePointer<Bool>(OpaquePointer(property.data))?.pointee ?? true
+                            VXProbeState.shared.setPlayer(buffering: buffering)
+                            VXProbe.event("player", "buffering \(buffering ? "start" : "end")")
                             self.emit(propertyName, buffering)
                         case MPVProperty.duration:
                             if let value = UnsafePointer<Double>(OpaquePointer(property.data))?.pointee {
+                                VXProbeState.shared.setPlayer(dur: Int(value))
                                 self.emit(propertyName, value)
                             }
                         case MPVProperty.seekable:
@@ -1548,17 +1588,28 @@ final class MPVMetalViewController: PlatformViewController {
                                 let minInterval = PerformanceMode.reduced ? 0.5 : 0.25
                                 if now - self.lastTimePosEmit >= minInterval {
                                     self.lastTimePosEmit = now
+                                    VXProbeState.shared.setPlayer(pos: Int(value))
                                     self.emit(propertyName, value)
                                 }
                             }
                         case MPVProperty.pause:
                             let paused = UnsafePointer<Bool>(OpaquePointer(property.data))?.pointee ?? false
+                            VXProbeState.shared.setPlayer(state: paused ? "paused" : "playing")
+                            VXProbe.log("player", paused ? "paused" : "playing")
                             self.emit(propertyName, paused)
                         case MPVProperty.trackList:
                             self.emit(propertyName, nil)
                         default: break
                         }
                     }
+                case MPV_EVENT_FILE_LOADED:
+                    // The file opened and its tracks/params are known. Push a compact source label (the
+                    // current path's host, redacted of any token-bearing query) into the probe state so the
+                    // heartbeat names what is playing, and mark the engine as mpv + state playing.
+                    let loadedHost = self.getString("path").flatMap { URL(string: $0)?.host }
+                        ?? self.playUrl?.host ?? "?"
+                    VXProbeState.shared.setPlayer(state: "playing", source: loadedHost, engine: "mpv")
+                    VXProbe.event("player", "loaded \(loadedHost)")
                 case MPV_EVENT_VIDEO_RECONFIG:
                     // The video output was (re)configured for the now-current file/params. This EVENT is
                     // not value-coalesced like the sig-peak property observer, so it fires reliably on
@@ -1579,8 +1630,10 @@ final class MPVMetalViewController: PlatformViewController {
                         if ef.reason == MPV_END_FILE_REASON_ERROR {
                             let msg = String(cString: mpv_error_string(ef.error))
                             self.mpvLog.error("end-file error: \(msg, privacy: .public)")
+                            VXProbe.event("player", "endfile error \(msg)")
                             self.emit(MPVProperty.endFileError, msg)
                         } else if ef.reason == MPV_END_FILE_REASON_EOF {
+                            VXProbe.event("player", "endfile eof")
                             self.emit(MPVProperty.endFileEof, nil)   // natural end → auto-play-next
                         }
                     }
