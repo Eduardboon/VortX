@@ -854,7 +854,7 @@ final class MPVMetalViewController: PlatformViewController {
             // is why the server "dies" on debrid, not just torrents. A 128 MiB read-ahead (down from 256)
             // is still ample for a fast debrid link and shaves ~128 MiB off the peak; the Mac (out-of-process
             // server + swap) keeps the larger buffer for slow-CDN resilience.
-            readAhead = isLocalStream ? "96MiB" : "128MiB"
+            readAhead = isLocalStream ? "96MiB" : "256MiB"   // owner-raised remote base 128 -> 256 (ATV 4K has headroom); Streaming-cache lifts it further
             #endif
         }
         // With the on-disk cache armed (Settings → Streaming cache) we lift `demuxer-max-bytes` for a
