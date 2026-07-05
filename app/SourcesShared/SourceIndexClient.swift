@@ -8,17 +8,19 @@ import CryptoKit
 /// playback or a screen):
 ///
 ///   1. HOARD (default ON, anonymous): whenever the app assembles a title's stream results from its add-ons /
-///      debrid / usenet / torrent sources, it reports the source DESCRIPTORS -- NOT the media, NOT the user's
-///      personal debrid-unlocked link, NOT any account token or user id. A descriptor is only
-///      { kind, id, quality, sizeBytes, sourceTag, seeders? } where `id` is a stable public identity of the
-///      source (a torrent infohash, a usenet nzb id, or sha256(url) for a direct link -- never the raw url).
-///      Fire-and-forget, batched into one POST, deduped by descriptor id.
+///      debrid / usenet / torrent sources, it reports the source DESCRIPTORS -- NOT the media, NOT any account
+///      token or user id. A descriptor is only { kind, id, quality, sizeBytes, sourceTag, seeders? } where `id`
+///      is the source's real, re-resolvable identity: a torrent infohash, a usenet nzb link, or the direct
+///      http link (owner directive 2026-07-05: share every source type so each user can resolve it with THEIR
+///      OWN debrid / TorBox key). The worker STRIPS credential query params before storing, so a contributor's
+///      indexer / debrid apikey never lands in the shared pool. Fire-and-forget, batched, deduped by id.
 ///
 ///   2. SERVE (opt-in): when the user turns the Singularity toggle ON AND is signed in, the detail / stream
-///      screen reads the corroborated pooled sources for the title and MERGES the actionable ones (torrent
-///      infohash + usenet nzb) into the stream list, labeled as community sources. Direct-link entries are
-///      keyed by sha256(url) with no recoverable url, so they cannot be reconstructed and are dropped. Empty
-///      on any miss; signed-out disables the read entirely (hard login gate, matching the worker).
+///      screen reads the corroborated pooled sources for the title and MERGES them into the stream list as
+///      community sources, ALL kinds now -- torrent (infohash), usenet (nzb link), and direct (http link) --
+///      each resolved by the user's own debrid / TorBox pipeline. A legacy hash-only row (older fleet stored
+///      sha256 for usenet/http) is not replayable and is dropped. Empty on any miss; signed-out disables the
+///      read entirely (hard login gate, matching the worker).
 ///
 /// GIVE-TO-GET: every method is additionally gated on `MoatConsent.contributeAndConsume`. If the user has
 /// opted out of the anonymized-data pool, this client neither contributes nor consumes.
@@ -92,24 +94,26 @@ enum SourceIndexClient {
         let quality = StreamRanking.qualityLabel(stream)
         let tag = sanitizeTag(sourceTag)
 
-        // USENET: keyed by a stable id derived from the nzb LINK (hashed, never the raw link, which may embed a
-        // user-specific token). Kind = usenet.
+        // USENET: keyed by the REAL nzb link so any user can re-resolve it with their own TorBox usenet plan
+        // (owner directive 2026-07-05: share every source type, resolve per-user). The worker STRIPS credential
+        // query params before storing, so a private-indexer apikey embedded in the link never lands in the pool
+        // (a link that genuinely needed that key just won't resolve for another user). Kind = usenet.
         if stream.isUsenet, let nzb = stream.nzbUrl, !nzb.isEmpty {
-            return Descriptor(kind: Kind.usenet.rawValue, id: sha256Hex(nzb), quality: quality,
+            return Descriptor(kind: Kind.usenet.rawValue, id: nzb, quality: quality,
                               sizeBytes: sizeBytes, sourceTag: tag, seeders: nil)
         }
         // TORRENT (raw OR debrid-resolved): keyed by the infohash, which is public and identity-stable. We use
         // the infohash whenever present, even if the add-on already handed us a personal resolved `url` -- the
-        // url is never sent.
+        // url is never sent (any personal resolved link stays out of the pool; the infohash re-resolves per-user).
         if let hash = stream.infoHash?.lowercased(), !hash.isEmpty {
             let seeders = StreamRanking.seedersForSort(stream)
             return Descriptor(kind: Kind.torrent.rawValue, id: hash, quality: quality,
                               sizeBytes: sizeBytes, sourceTag: tag, seeders: seeders >= 0 ? seeders : nil)
         }
-        // DIRECT: a plain http(s) link with no infohash. Keyed by sha256(url) so the pool can corroborate its
-        // existence WITHOUT ever holding (or being able to reconstruct) the actual link. Kind = direct.
+        // DIRECT: a plain http(s) link with no infohash. Now keyed by the REAL link so another user can play it
+        // (or unrestrict it through their own debrid), credential params stripped worker-side. Kind = direct.
         if let url = stream.url, !url.isEmpty {
-            return Descriptor(kind: Kind.direct.rawValue, id: sha256Hex(url), quality: quality,
+            return Descriptor(kind: Kind.direct.rawValue, id: url, quality: quality,
                               sizeBytes: sizeBytes, sourceTag: tag, seeders: nil)
         }
         return nil
@@ -243,12 +247,11 @@ enum SourceIndexClient {
             VXProbe.log("sing", "fetchPooled URLComponents FAILED contentID=\(contentID) -> []")
             return []
         }
-        // Ask for torrents ONLY: those are the cross-user PLAYABLE sources (infohash-keyed). Direct-http
-        // pool entries are stored as sha256(url) for privacy and cannot be replayed, so requesting all kinds
-        // just let unplayable http rows crowd the playable torrents out of the server's MAX_SERVE window.
+        // Ask for ALL kinds (no &kind filter): torrent, usenet, AND direct are now cross-user playable (the
+        // worker stores real, credential-stripped links; each user resolves per-account). streams(from:) rebuilds
+        // each kind and drops any legacy hash-only row it cannot replay.
         comps.queryItems = [
             URLQueryItem(name: "content_id", value: contentID),
-            URLQueryItem(name: "kind", value: "torrent"),
         ]
         guard let url = comps.url else {
             VXProbe.log("sing", "fetchPooled url build FAILED contentID=\(contentID) -> []")
@@ -286,25 +289,36 @@ enum SourceIndexClient {
         }
     }
 
-    /// Turn the corroborated pooled sources into playable `CoreStream`s to merge into the source list. Only the
-    /// ACTIONABLE kinds are reconstructable: a torrent (its infohash IS the id) and a usenet source keyed by an
-    /// nzb id we can hand back only if the pool also returns a link -- since we deliberately never stored the raw
-    /// nzb link, usenet + direct pooled entries are NOT reconstructable and are dropped. So SERVE surfaces
-    /// community-corroborated TORRENTS the user's own add-ons did not return. Fail-soft: empty on nothing usable.
+    /// Turn the corroborated pooled sources into playable `CoreStream`s to merge into the source list. ALL three
+    /// kinds are now reconstructable: a torrent (infohash id), a usenet source (real nzb link id), and a direct
+    /// source (real http link id). The user's existing debrid / TorBox pipeline then resolves each one with
+    /// THEIR OWN keys (infohash -> debrid, nzb -> TorBox usenet, http -> play-or-unrestrict). A LEGACY row whose
+    /// id is a bare hash (old fleet stored sha256 for usenet/http) is not replayable and is dropped. Fail-soft.
     static func streams(from pooled: [PooledSource]) -> [CoreStream] {
         let built: [CoreStream] = pooled.compactMap { src -> CoreStream? in
-            guard src.kind == Kind.torrent.rawValue, let hash = src.id, !hash.isEmpty,
-                  hash.range(of: #"^[0-9a-fA-F]{20,64}$"#, options: .regularExpression) != nil else { return nil }
+            guard let kind = src.kind, let id = src.id, !id.isEmpty else { return nil }
             let quality = (src.quality?.isEmpty == false) ? src.quality! : "Source"
             let sizeSuffix = (src.sizeBytes ?? 0) > 0 ? " · \(byteSize(src.sizeBytes!))" : ""
             let seedSuffix = src.seeders.map { " · 👤 \($0)" } ?? ""
             // Name/desc both say "Singularity" so the source ROW is visibly a Singularity source (the group
             // label is discarded by the quality re-grouping, but this per-stream text survives and renders).
             let name = "\(quality) · Singularity"
-            let desc = "Singularity source\(sizeSuffix)\(seedSuffix)"
-            return make(name: name, description: desc, infoHash: hash.lowercased())
+            let isLink = id.lowercased().hasPrefix("http://") || id.lowercased().hasPrefix("https://")
+            switch kind {
+            case Kind.torrent.rawValue:
+                guard id.range(of: #"^[0-9a-fA-F]{20,64}$"#, options: .regularExpression) != nil else { return nil }
+                return make(name: name, description: "Singularity source\(sizeSuffix)\(seedSuffix)", infoHash: id.lowercased())
+            case Kind.usenet.rawValue:
+                guard isLink else { return nil }   // legacy hashed nzb ids are unreplayable
+                return make(name: name, description: "Singularity usenet\(sizeSuffix)", nzbUrl: id)
+            case "http", Kind.direct.rawValue:
+                guard isLink else { return nil }   // legacy sha256(url) rows are unreplayable
+                return make(name: name, description: "Singularity source\(sizeSuffix)", url: id)
+            default:
+                return nil
+            }
         }
-        VXProbe.log("sing", "streams(from:) reconstruct pooled=\(pooled.count) -> playable torrents=\(built.count) (usenet/direct/non-torrent dropped)")
+        VXProbe.log("sing", "streams(from:) reconstruct pooled=\(pooled.count) -> playable=\(built.count) (torrent+usenet+direct; legacy-hash rows dropped)")
         return built
     }
 
@@ -384,7 +398,19 @@ enum SourceIndexClient {
     /// Build a `CoreStream` via JSON decode (the all-optional field set has no memberwise init), mirroring
     /// `TorBoxSearch.make`.
     private static func make(name: String, description: String, infoHash: String) -> CoreStream? {
-        let json: [String: Any] = ["name": name, "description": description, "infoHash": infoHash]
+        decodeStream(["name": name, "description": description, "infoHash": infoHash])
+    }
+    /// A direct source: the `url` field marks it a plain http(s) stream (the existing player plays it, or the
+    /// user's debrid unrestricts it).
+    private static func make(name: String, description: String, url: String) -> CoreStream? {
+        decodeStream(["name": name, "description": description, "url": url])
+    }
+    /// A usenet source: a non-nil `nzbUrl` makes CoreStream report `isUsenet`, so the existing TorBox usenet
+    /// path resolves it with the user's own TorBox account (when their plan supports usenet).
+    private static func make(name: String, description: String, nzbUrl: String) -> CoreStream? {
+        decodeStream(["name": name, "description": description, "nzbUrl": nzbUrl])
+    }
+    private static func decodeStream(_ json: [String: Any]) -> CoreStream? {
         guard let data = try? JSONSerialization.data(withJSONObject: json) else { return nil }
         return try? JSONDecoder().decode(CoreStream.self, from: data)
     }
