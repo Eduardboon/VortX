@@ -102,11 +102,18 @@ struct AddonsView: View {
     @State private var addonSheet: AddonSheet?   // the per-add-on Configure / Change-URL sheet
     @State private var showUpdateConfirm = false   // "already installed -> update?" prompt
     @State private var showPairing = false         // the Install-by-QR "pair once, add many" sheet
+    // Observed + READ in body (see `let _ = orderObserver.revision`) so the list re-sorts LIVE after a
+    // reorder. appliedAddonOrder is a plain UserDefaults static, not @Published, so this is SwiftUI's only
+    // signal to re-run orderedByApplied; without it the new order showed only on the next cold launch.
+    @ObservedObject private var orderObserver = AddonOrderObserver.shared
 
     var body: some View {
         NavigationStack {
             ScrollView {
                 VStack(alignment: .leading, spacing: Theme.Space.lg) {
+                    // Read the shared order revision so a reorder (in-app drag or remote pull) re-runs body and
+                    // re-sorts the ForEach below via orderedByApplied. Must be READ in body to be tracked.
+                    let _ = orderObserver.revision
                     Text("Add-ons").screenTitleStyle()
                     if !account.isSignedIn {
                         hint("Sign in to manage your add-ons. They sync across your devices and the official apps.")
@@ -129,6 +136,28 @@ struct AddonsView: View {
                                 .background(Theme.Palette.surface1, in: RoundedRectangle(cornerRadius: Theme.Radius.card, style: .continuous))
                             }
                             .buttonStyle(.plain)
+                            // Drag add-ons into the order you want. The order is the PRIORITY spine (which
+                            // add-on's catalogs and sources come first) and syncs to the dashboard + your
+                            // other devices via doc.addonOrder, the same order the dashboard drag writes.
+                            // iOS / Mac only: the drag-reorder List needs the touch/pointer drag tvOS lacks
+                            // (tvOS reorder is a separate focus-based UX); the dashboard covers tvOS ordering.
+                            #if !os(tvOS)
+                            if core.addons.count > 1 {
+                                NavigationLink { AddonReorderView() } label: {
+                                    HStack(spacing: Theme.Space.md) {
+                                        Label("Reorder add-ons", systemImage: "arrow.up.arrow.down")
+                                            .font(Theme.Typography.cardTitle)
+                                            .foregroundStyle(Theme.Palette.textPrimary)
+                                        Spacer()
+                                        Image(systemName: "chevron.right").foregroundStyle(Theme.Palette.textTertiary)
+                                    }
+                                    .padding(Theme.Space.md)
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                                    .background(Theme.Palette.surface1, in: RoundedRectangle(cornerRadius: Theme.Radius.card, style: .continuous))
+                                }
+                                .buttonStyle(.plain)
+                            }
+                            #endif
                             hint("Tap the eye to turn an add-on off for \(profiles.active?.name ?? "this profile") only. It stays installed on your account and stays on for your other profiles.")
                             HStack {
                                 // tvOS: keep the button LEFT-aligned so it sits directly above the first
@@ -150,7 +179,7 @@ struct AddonsView: View {
                                 Spacer()
                                 #endif
                             }
-                            ForEach(core.addons) { addon in addonRow(addon) }
+                            ForEach(VortXSyncManager.orderedByApplied(core.addons, url: { $0.transportUrl })) { addon in addonRow(addon) }
                         }
                     }
                 }
@@ -388,6 +417,64 @@ struct AddonsView: View {
             .padding(.top, Theme.Space.sm)
     }
 }
+
+#if !os(tvOS)
+/// Drag the installed add-ons into your preferred PRIORITY order (which add-on's catalogs and sources come
+/// first). Each drop writes `VortXSyncManager.appliedAddonOrder` and pushes it immediately, so the order
+/// syncs to the dashboard and your other devices via doc.addonOrder - the same order the dashboard drag
+/// writes. iOS forces edit mode on; macOS reorders by native row drag. iOS / Mac only (tvOS lacks the drag).
+struct AddonReorderView: View {
+    @EnvironmentObject private var core: CoreBridge
+    @EnvironmentObject private var theme: ThemeManager   // observe textScale so Theme.Typography repaints live
+    @State private var ordered: [CoreDescriptor] = []
+
+    var body: some View {
+        List {
+            ForEach(ordered) { addon in
+                HStack(spacing: Theme.Space.md) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(addon.manifest.name)
+                            .font(Theme.Typography.cardTitle)
+                            .foregroundStyle(Theme.Palette.textPrimary)
+                            .lineLimit(1)
+                        Text(addon.host)
+                            .font(.system(size: 14, design: .monospaced))
+                            .foregroundStyle(Theme.Palette.textTertiary)
+                            .lineLimit(1).truncationMode(.middle)
+                    }
+                    Spacer()
+                    Image(systemName: "line.3.horizontal").foregroundStyle(Theme.Palette.textTertiary)
+                }
+                .padding(.vertical, 4)
+                .listRowBackground(Theme.Palette.surface1)
+                .listRowSeparator(.hidden)
+            }
+            .onMove(perform: move)
+        }
+        .scrollContentBackground(.hidden)
+        .background(Theme.Palette.canvas.ignoresSafeArea())
+        #if os(iOS)
+        .navigationTitle("Reorder Add-ons")
+        .navigationBarTitleDisplayMode(.inline)
+        .environment(\.editMode, .constant(.active))
+        #endif
+        .macBackAffordance()
+        .onAppear { reload() }
+        .onChange(of: core.addons.count) { _ in reload() }   // an install/remove elsewhere re-seeds the list
+    }
+
+    /// Re-seed from the live add-on set in the currently-applied order. Preserves the user's order and folds
+    /// in any add-on installed since (appended at the end by orderedByApplied).
+    private func reload() {
+        ordered = VortXSyncManager.orderedByApplied(core.addons, url: { $0.transportUrl })
+    }
+
+    private func move(from source: IndexSet, to destination: Int) {
+        ordered.move(fromOffsets: source, toOffset: destination)
+        VortXSyncManager.shared.applyInAppAddonOrder(ordered.map { $0.transportUrl })
+    }
+}
+#endif
 
 /// Configure a configurable add-on. On iPhone, iPad, and Mac it opens the add-on's web configuration
 /// page in the browser; on Apple TV (which has no browser) it shows that page as a QR to finish on a

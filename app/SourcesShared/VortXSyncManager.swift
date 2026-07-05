@@ -1,6 +1,23 @@
 import Foundation
 import SwiftUI
 
+/// Bridges the thread-agnostic `VortXSyncManager.addonOrderChangedNote` to a `@Published` the add-on list
+/// READS in its body, so a reorder re-sorts the live list immediately. A never-read `@State` bumped from
+/// `.onReceive` did not survive the Reorder screen's NavigationStack push/pop (SwiftUI snapshots the covered
+/// root); an `@ObservedObject` whose value is read in body does, because SwiftUI re-renders a reappearing
+/// view when a tracked dependency changed while it was covered. Small + dedicated so views observing it do
+/// not also re-render on VortXSyncManager's unrelated account/sign-in @Published churn.
+final class AddonOrderObserver: ObservableObject {
+    static let shared = AddonOrderObserver()
+    @Published private(set) var revision = 0
+    private init() {
+        // queue: .main -> the block (and the @Published mutation) run on the main thread, which SwiftUI requires.
+        NotificationCenter.default.addObserver(forName: VortXSyncManager.addonOrderChangedNote, object: nil, queue: .main) { [weak self] _ in
+            self?.revision &+= 1
+        }
+    }
+}
+
 /// The VortX end-to-end-encrypted account on-device: create / sign in / recover / sign out, plus
 /// push and pull the encrypted sync document. Mirrors the website (vortx-site/src/lib/vault.ts) and
 /// the Cloudflare Worker contract through VortXSyncCrypto. The session token, account, and the data
@@ -49,6 +66,47 @@ final class VortXSyncManager: ObservableObject {
     static var appliedAddonOrder: [String] {
         get { UserDefaults.standard.stringArray(forKey: kAddonOrderKey) ?? [] }
         set { UserDefaults.standard.set(newValue, forKey: kAddonOrderKey) }
+    }
+    /// Posted (main thread) whenever the shared add-on order changes: an in-app Reorder drag or a remote
+    /// pull that carried a newer order. Views showing the add-on list observe it to re-sort live, since
+    /// appliedAddonOrder is a plain UserDefaults static (not @Published) and gives SwiftUI no other signal.
+    static let addonOrderChangedNote = Notification.Name("vortx.addonOrderChanged")
+
+    /// Sort a live list of items by the shared `appliedAddonOrder` (the in-app / dashboard reorder), keyed
+    /// by each item's transport URL. Items present in the order come first, in that order; any not yet in it
+    /// (a fresh install) keep their original relative order at the END so they are never hidden. An empty
+    /// order returns the input unchanged, so this is a no-op until the user actually reorders.
+    static func orderedByApplied<T>(_ items: [T], url: (T) -> String) -> [T] {
+        let order = appliedAddonOrder
+        guard !order.isEmpty else { return items }
+        var index: [String: Int] = [:]
+        for (i, u) in order.enumerated() { index[u] = i }
+        return items.enumerated().sorted { a, b in
+            let ia = index[AddonTombstones.normalize(url(a.element))]
+            let ib = index[AddonTombstones.normalize(url(b.element))]
+            switch (ia, ib) {
+            case let (x?, y?): return x < y
+            case (_?, nil):    return true                 // ordered items before not-yet-ordered
+            case (nil, _?):    return false
+            case (nil, nil):   return a.offset < b.offset  // stable for the un-ordered tail
+            }
+        }.map(\.element)
+    }
+
+    /// Persist a user-chosen add-on order (the in-app Reorder screen) and push it to the account IMMEDIATELY
+    /// so the dashboard and the user's other devices converge, mirroring the dashboard's doc.addonOrder write.
+    /// The immediate push avoids the debounce-starvation that delayed removals (see uninstallAddon).
+    func applyInAppAddonOrder(_ transportUrls: [String]) {
+        let normalized = transportUrls.map { AddonTombstones.normalize($0) }
+        guard normalized != Self.appliedAddonOrder else { return }
+        Self.appliedAddonOrder = normalized
+        // Refresh any live add-on list NOW: appliedAddonOrder is a plain UserDefaults static, not @Published,
+        // so views showing the list have no other signal to re-run orderedByApplied on their current body.
+        NotificationCenter.default.post(name: Self.addonOrderChangedNote, object: nil)
+        Task {
+            let ok = await pushThisDevice()
+            NSLog("[addon] in-app reorder pushed to sync (%d add-ons, ok=%@)", normalized.count, ok ? "yes" : "no")
+        }
     }
     private var hasPendingPush = false  // a debounced syncUp is queued; don't pull over it
     /// Set while syncDown is applying a remote pull (the SettingsBackup.restore + apiKeys + overlays +
@@ -632,14 +690,25 @@ final class VortXSyncManager: ObservableObject {
     static func currentAddonOrder() -> [String] {
         let removed = AddonTombstones.all()
         var seen = Set<String>()
-        var order: [String] = []
+        var live: [String] = []
         for raw in CoreBridge.shared.rawAddonDescriptorsOrdered() {
             guard let url = raw["transportUrl"] as? String, !url.isEmpty else { continue }
             let normalized = AddonTombstones.normalize(url)
             guard !removed.contains(normalized), seen.insert(normalized).inserted else { continue }
-            order.append(normalized)
+            live.append(normalized)
         }
-        return order
+        // Prefer the user's shared order (in-app Reorder screen or the dashboard drag): take the applied
+        // order intersected with the LIVE set (so an uninstalled/removed add-on drops out), then append any
+        // live add-on not yet in it (a fresh install) so it is never lost. This makes an in-app reorder the
+        // value that gets PUSHED, so it converges instead of the next push overwriting it with the raw engine
+        // Vec order. Empty applied order -> the live engine order unchanged (no behavior change until reorder).
+        let applied = appliedAddonOrder
+        guard !applied.isEmpty else { return live }
+        let liveSet = Set(live)
+        var result = applied.filter { liveSet.contains($0) }
+        let inResult = Set(result)
+        result.append(contentsOf: live.filter { !inResult.contains($0) })
+        return result
     }
 
     /// Pull the account's profiles + settings (and metadata keys) and apply them locally. True if anything
@@ -760,6 +829,8 @@ final class VortXSyncManager: ObservableObject {
             if normalized != Self.appliedAddonOrder {
                 Self.appliedAddonOrder = normalized
                 restored = true
+                // A remote reorder landed: refresh any live add-on list on the main thread.
+                DispatchQueue.main.async { NotificationCenter.default.post(name: Self.addonOrderChangedNote, object: nil) }
             }
         }
         let removedAddonSet = AddonTombstones.all()
