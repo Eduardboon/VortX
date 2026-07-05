@@ -408,7 +408,20 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
             }
         }
 
-        while !isCancelled, av_read_frame(inCtx, pkt) >= 0 {
+        // AVERROR_EOF = FFERRTAG('E','O','F',' ') = -541478725. Distinguish a genuine end-of-stream from a
+        // MID-STREAM read failure (a debrid CDN dropping mid-film once the reconnect attempts are exhausted).
+        // The old `av_read_frame >= 0` loop condition treated BOTH as EOF and fell through to write_trailer +
+        // buffer.finish(), so a truncated stream ended playback cleanly with no error and no AVPlayer -> libmpv
+        // demotion. A mid-stream error now fails the buffer so the loader errors the request and the chrome
+        // can re-open the link on libmpv.
+        let AVERROR_EOF_CONST: Int32 = -541478725
+        while !isCancelled {
+            let rf = av_read_frame(inCtx, pkt)
+            if rf < 0 {
+                if rf == AVERROR_EOF_CONST { break }   // genuine EOF: write the trailer + finish() below
+                if !isCancelled { buffer.fail("source read failed mid-stream (rc=\(rf))"); return }
+                break
+            }
             let inIdx = Int(pkt.pointee.stream_index)
             guard inIdx >= 0, inIdx < nb, streamMap[inIdx] >= 0,
                   let inStream = inCtx.pointee.streams[inIdx],

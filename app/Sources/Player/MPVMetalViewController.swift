@@ -1070,6 +1070,7 @@ final class MPVMetalViewController: PlatformViewController {
     }
     
     private func getFlag(_ name: String) -> Bool {
+        guard mpv != nil else { return false }   // teardown nils mpv; a late togglePause() must not pass NULL to libmpv
         var data = Int64()
         mpv_get_property(mpv, name, MPV_FORMAT_FLAG, &data)
         return data > 0

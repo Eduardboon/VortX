@@ -1413,23 +1413,28 @@ final class CoreBridge: ObservableObject {
             return // "CoreEvent" (auth results, errors, …) handled in a later step.
         }
 
-        // Legacy authKey finished seeding (ctx now logged in) → pull addons + library + board, once.
-        if awaitingAuthMigration, fields.contains("ctx"), isLoggedIn() {
-            awaitingAuthMigration = false
-            NSLog("[CoreBridge] authKey migrated → pulling addons + syncing library")
-            refreshFromAPI()
-            DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in self?.loadBoard() }
-        }
-
-        // A profile's account switch landed (the ctx uid moved off the old session) → reload all
-        // per-account state. Authenticate already pulls addons + library; the explicit refresh and
-        // board load repopulate our published screens.
-        if switchInFlight, fields.contains("ctx"), isLoggedIn(), currentUID() != switchFromUID {
-            switchInFlight = false
-            switchFromUID = nil
-            NSLog("[CoreBridge] account switch complete → reloading")
-            refreshFromAPI()
-            DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in self?.loadBoard() }
+        // Legacy authKey migration + account-switch completion both depend on `ctx` landing while logged in.
+        // Their state (awaitingAuthMigration, switchInFlight, switchFromUID) is ALSO written on the MAIN thread
+        // (bootstrapAuth / switchAccount + its 6s backstop), so read+write it on main here too rather than on
+        // this Rust worker thread, matching the decode branches below. Otherwise switchInFlight could latch
+        // stuck-true (the switched account never reloads) through an unsynchronized cross-thread write.
+        if fields.contains("ctx") {
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                if self.awaitingAuthMigration, self.isLoggedIn() {
+                    self.awaitingAuthMigration = false
+                    NSLog("[CoreBridge] authKey migrated -> pulling addons + syncing library")
+                    self.refreshFromAPI()
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in self?.loadBoard() }
+                }
+                if self.switchInFlight, self.isLoggedIn(), self.currentUID() != self.switchFromUID {
+                    self.switchInFlight = false
+                    self.switchFromUID = nil
+                    NSLog("[CoreBridge] account switch complete -> reloading")
+                    self.refreshFromAPI()
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in self?.loadBoard() }
+                }
+            }
         }
 
         // Decode the changed screens off the main thread, then publish on main.

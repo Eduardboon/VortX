@@ -403,15 +403,20 @@ struct PlayerScreen: View {
     // Playback-info overlay rows, refreshed while the Info panel is open.
     @State private var infoRows: [(String, String)] = []
 
+    // iOS bare-HLS AVPlayer reported the item .failed (dead link / bad codec): route to libmpv (mpvBody) instead
+    // of spinning forever on the buffering overlay.
+    @State private var hlsFailed = false
+
     var body: some View {
         Group {
             #if os(iOS)
             // Adaptive-HLS (.m3u8) streams play in AVPlayer (native ABR + AirPlay + PiP); libmpv, which can't
             // ramp HLS renditions mid-stream, keeps everything else. macOS keeps libmpv (its out-of-process
             // server can transcode HLS); tvOS routes HLS in TVPlayerView.
-            if PlayerEngineRouter.currentOverride == .auto, HLSPlayerView.handles(url) {
+            if PlayerEngineRouter.currentOverride == .auto, HLSPlayerView.handles(url), !hlsFailed {
                 HLSPlayerView(url: url, title: curTitle, headers: headers, resumeSeconds: resumeSeconds,
-                              onProgress: onProgress, onClose: onClose)
+                              onProgress: onProgress, onClose: onClose,
+                              onLoadFailed: { hlsFailed = true })   // dead HLS link -> fall back to libmpv (mpvBody)
                     .ignoresSafeArea()
                     .statusBarHidden(true)
             } else {
