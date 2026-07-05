@@ -221,6 +221,7 @@ struct iOSDetailView: View {
     /// Separate memo for the LIVE list (it ranks with continuity: nil, so it must not share the movie memo's cache).
     @State private var liveRankMemo = DetailRankMemo()
     @State private var season = 1
+    @State private var didApplySeason = false   // once the initial-season hint lands (or the user taps a season), stop re-applying it
     @State private var settleTimedOut = false            // movie/live resolution gave up → "No sources found", not a spinner
     // Debrid cache AWARENESS for the movie/live source list: which raw torrents the user's debrid account
     // has cached, so they badge + rank up. Empty (zero badges, ranking unchanged) with no debrid key.
@@ -1307,6 +1308,19 @@ struct iOSDetailView: View {
 
     /// Resume position (the saved episode, if not yet watched) vs the first unwatched episode,
     /// vs the first episode — a straight port of the tvOS `seriesPrimaryEpisode`.
+    /// The season of the episode the viewer was last on (from the resume videoId), decoupled from the
+    /// watched-gate seriesPrimaryEpisode applies, so opening a series from Continue Watching lands on the season
+    /// you were last in even after that episode is marked watched. nil when there is no resume position. Mirrors
+    /// the tvOS DetailView helper; seriesPrimaryEpisode still drives the Resume/Play button unchanged.
+    private func resumeSeasonHint(_ videos: [CoreVideo]) -> Int? {
+        guard let m = meta else { return nil }
+        let videoId: String? = profiles.activeUsesEngineHistory
+            ? core.metaDetails?.libraryItem?.state.videoId
+            : profiles.watch[m.id]?.videoId
+        guard let videoId else { return nil }
+        return sortedEpisodes(videos).first { $0.id == videoId }?.season
+    }
+
     private func seriesPrimaryEpisode(_ videos: [CoreVideo]) -> (video: CoreVideo, isResume: Bool)? {
         guard let m = meta else { return nil }
         let sorted = sortedEpisodes(videos)
@@ -1378,6 +1392,19 @@ struct iOSDetailView: View {
         guard let videos = meta?.videos else { return nil }
         let watched = watchedSet
         return sortedEpisodes(videos).first { !watched.contains($0.id) }?.season
+    }
+
+    /// Apply the preferred episode-list season: the Continue-Watching resume-season hint, else first-unwatched,
+    /// else the first non-special, else 1. Re-applies (guarded by didApplySeason so a manual tap wins) until it
+    /// lands on a season present in `seasons`, so a large series whose episodes stream in after the list first
+    /// appears still opens on the season you were last watching. Mirrors the tvOS CoreSeasonedEpisodes resolver.
+    private func applyEpisodeSeason(_ seasons: [Int]) {
+        guard let videos = meta?.videos else { return }
+        if !didApplySeason {
+            let preferred = resumeSeasonHint(videos) ?? firstUnwatchedSeason ?? seasons.first { $0 > 0 } ?? seasons.first ?? 1
+            if seasons.contains(preferred) { season = preferred }   // triggers onChange(season) -> didApplySeason = true
+        }
+        if !seasons.contains(season) { season = seasons.first { $0 > 0 } ?? seasons.first ?? 1 }
     }
 
     /// 0…1 watch progress for one episode (overlay or engine source, matching the resume invariant).
@@ -2297,13 +2324,16 @@ struct iOSDetailView: View {
                 }
             }
             .padding(.horizontal, Theme.Space.md)
-            // Initial season = first-unwatched season, else the first non-special, else season 1 —
-            // the tvOS `initialSeason ?? firstUnwatchedSeason ?? first non-special` rule.
-            .onAppear {
-                let preferred = firstUnwatchedSeason ?? seasons.first { $0 > 0 } ?? seasons.first ?? 1
-                if seasons.contains(preferred) { season = preferred }
-                else if !seasons.contains(season) { season = seasons.first { $0 > 0 } ?? seasons.first ?? 1 }
+            // Initial season = the season you were LAST watching (Continue Watching), else first-unwatched,
+            // else the first non-special, else 1 — matching the tvOS rule. Re-applies when a large series'
+            // episodes stream in after the list first appears (onChange videos.count), guarded so a manual tap
+            // is never overridden.
+            .onAppear { applyEpisodeSeason(seasons) }
+            // Single-param onChange: the zero-/two-param forms are iOS 17+, target here is iOS 16.
+            .onChange(of: videos.count) { _ in
+                applyEpisodeSeason(Array(Set(videos.compactMap { $0.season })).sorted())
             }
+            .onChange(of: season) { _ in didApplySeason = true }
         }
     }
 
