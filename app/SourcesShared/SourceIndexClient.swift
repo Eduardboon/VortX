@@ -344,23 +344,14 @@ enum SourceIndexClient {
     /// The stable group id `merged(into:)` stamps on Singularity's merged source group, so the source lists
     /// can find it without a magic string.
     static let groupID = "vortx.singularity.sources"
-    /// The user-facing label on Singularity's source group + rows. Kept as one constant so the pinned section
-    /// header, the row labels, and the merge all read identically.
+    /// The user-facing label on Singularity's source group + rows. Kept as one constant so the row labels
+    /// and the merge all read identically.
+    ///
+    /// NOTE (owner decision): Singularity renders INLINE ONLY, as this one merged group flowing through
+    /// the ranked list like any add-on, sortable with the user's sort. The old pinned top-of-list section
+    /// (`pinnedStreams` / `pinnedSectionMax`) duplicated the same sources unsortably above the list and
+    /// was removed on both platforms.
     static let groupAddon = "Singularity"
-
-    /// The most Singularity sources the pinned top-of-list section may show, so a title with many corroborated
-    /// Singularity sources cannot drown the normal add-on grouping. The rest stay reachable in the full list.
-    static let pinnedSectionMax = 6
-
-    /// Pull the pinned-section streams (best few Singularity sources) out of the already-ranked, already-merged
-    /// `groups`, so the source lists can float them to the very top. `groups` MUST be the ranked output so the
-    /// slice is best-first (highest corroboration then quality). Returns `[]` when the pool contributed nothing
-    /// for this title, so the section is a pure pass-through (no header, list unchanged). Caps at
-    /// `pinnedSectionMax`; the remaining Singularity sources still render under the normal grouping.
-    static func pinnedStreams(from groups: [CoreStreamSourceGroup]) -> [CoreStream] {
-        guard let group = groups.first(where: { $0.id == groupID }) else { return [] }
-        return Array(group.streams.prefix(pinnedSectionMax))
-    }
 
     // MARK: - Helpers
 
@@ -433,7 +424,10 @@ enum SourceIndexClient {
 final class SourceIndexServeSource: ObservableObject {
     /// The corroborated community streams, ready to merge. Empty until a fetch completes (and always when the
     /// SERVE toggle is off / signed out / consent withdrawn).
-    @Published private(set) var streams: [CoreStream] = []
+    @Published private(set) var streams: [CoreStream] = [] { didSet { epoch &+= 1 } }
+    /// Monotonic epoch bumped whenever `streams` is REPLACED. `SourceListModel` folds this into its
+    /// O(1) rebuild signature (a single Int compare instead of hashing the array).
+    private(set) var epoch = 0
 
     private var lastContentID: String?
     private var task: Task<Void, Never>?
@@ -469,24 +463,29 @@ final class SourceIndexServeSource: ObservableObject {
     /// cover). We drop only internal duplicates within Singularity's own list, by infoHash. Empty pool (SERVE off
     /// / not signed in / fleet-off / nothing corroborated) is a pure pass-through, so the list is unchanged.
     func merged(into groups: [CoreStreamSourceGroup]) -> [CoreStreamSourceGroup] {
-        guard !streams.isEmpty else {
-            VXProbe.log("sing", "merged PASS-THROUGH singularityStreams=0 -> groups unchanged (\(groups.count) groups)")
-            return groups
-        }
+        Self.merge(streams, into: groups)
+    }
+
+    /// The pure merge. `nonisolated static` so `SourceListModel`'s off-main assembly can run it over a
+    /// snapshotted `streams` array without hopping to the main actor; the instance `merged(into:)`
+    /// wraps it for the existing main-actor call sites.
+    ///
+    /// DELIBERATELY SILENT: the old per-call `[sing] merged` probe fired on every SwiftUI body eval
+    /// (thousands of lines, ~150 ms apart, on a loading title) and was the log-flood symptom of the
+    /// main-thread source-list storm. The `[sing] merged` health log now lives in
+    /// `SourceListModel.rebuild`, once per coalesced rebuild, where its frequency is the metric.
+    nonisolated static func merge(_ extra: [CoreStream], into groups: [CoreStreamSourceGroup]) -> [CoreStreamSourceGroup] {
+        guard !extra.isEmpty else { return groups }
         var seen: Set<String> = []
         var own: [CoreStream] = []
-        for s in streams {
+        for s in extra {
             guard let h = s.infoHash?.lowercased() else { continue }
             if seen.insert(h).inserted { own.append(s) }
         }
         // NOTE: `own` is deduped ONLY within Singularity's own list (by infoHash); it is deliberately NOT
         // deduped against the user's add-on groups, so a release your add-ons already return still appears
         // under the Singularity label.
-        guard !own.isEmpty else {
-            VXProbe.log("sing", "merged singularityStreams=\(streams.count) survivingInternalDedup=0 -> groups unchanged (\(groups.count) groups)")
-            return groups
-        }
-        VXProbe.log("sing", "merged GROUP produced addon=\(SourceIndexClient.groupAddon) streamCount=\(own.count) (from singularityStreams=\(streams.count), internal-dedup only, NOT deduped vs user add-ons) totalGroups=\(groups.count + 1)")
+        guard !own.isEmpty else { return groups }
         return groups + [CoreStreamSourceGroup(id: SourceIndexClient.groupID, addon: SourceIndexClient.groupAddon, streams: own)]
     }
 }

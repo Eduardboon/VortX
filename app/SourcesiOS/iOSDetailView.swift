@@ -214,12 +214,12 @@ struct iOSDetailView: View {
     // always presents reliably. The player-cover variant sizes its content to fill the macOS window.
     @State private var presentation: Presentation?
     @State private var preparing = false                 // movie Watch Now is resolving
-    /// Caches the expensive rankedGroups + best across body re-evaluations (see DetailRankMemo). @State (not
-    /// @StateObject): the cache must NOT publish or it would re-render on every hit. The movie body computes the
-    /// rank in THREE places (movieBest, watchNow, sourceSection); one memo collapses them to a single rank.
-    @State private var rankMemo = DetailRankMemo()
-    /// Separate memo for the LIVE list (it ranks with continuity: nil, so it must not share the movie memo's cache).
-    @State private var liveRankMemo = DetailRankMemo()
+    /// Owns the source-list assembly + ranking OFF the SwiftUI render path (snapshot -> merge -> rank
+    /// off-main -> publish once, coalesced at ~250 ms). The body reads only its published output, so a
+    /// CoreBridge revision storm during source search no longer rebuilds a 1000+ stream list per body
+    /// eval (the Mac force-quit / dead-keyboard root cause). Serves BOTH the movie and the live page
+    /// (a screen is one or the other; rankedGroups ignores continuity, so the group order is shared).
+    @StateObject private var sourceList = SourceListModel()
     @State private var season = 1
     @State private var didApplySeason = false   // once the initial-season hint lands (or the user taps a season), stop re-applying it
     @State private var settleTimedOut = false            // movie/live resolution gave up → "No sources found", not a spinner
@@ -469,6 +469,9 @@ struct iOSDetailView: View {
         // Guard the meta load: the shared CoreBridge already holds this title's meta on an A -> back -> A
         // revisit, so re-loading it churns the engine and momentarily blanks the hero for no reason.
         .onAppear {
+            // Wire the source-list model to this screen's sources (idempotent; nudges a refresh on
+            // re-appear). The model owns assembly + ranking off-main from here on.
+            sourceList.bind(core: core, torbox: torboxSearch, singularity: sourceIndex, debridCache: debridCache)
             if effectiveType == "series" {
                 // A series detail loads meta only; streams load per-episode from iOSEpisodeStreams.
                 if core.metaDetails?.meta?.id != id { core.loadMeta(type: effectiveType, id: id) }
@@ -1583,6 +1586,9 @@ struct iOSDetailView: View {
             download: movieDownloadHandler,
             isSuspended: suspended
         )
+        // Equatable gate: unrelated detail re-renders (progress ticks, hero state) skip re-diffing the
+        // 1000+ row list; the groups compare is a buffer-identity fast path until the model republishes.
+        .equatable()
         .padding(.horizontal, Theme.Space.md)
     }
 
@@ -1872,30 +1878,21 @@ struct iOSDetailView: View {
         return LastStreamStore.entry(for: m.id, profileID: ProfileStore.shared.activeID)?.qualityText
     }
 
-    /// The memoized ranked groups + best for the MOVIE source set. Folds the cheap O(groups) signature (stream
-    /// set id#count, pin, debrid cache contents, Kids guard, ranking prefs, remembered quality) so an unrelated
-    /// CoreBridge bump reuses the last rank instead of re-sorting a 1000+ stream list. Mirrors tvOS fed79fc and
-    /// collapses the movie body's three rank sites (movieBest, watchNow, sourceSection) to a single rank per pass.
+    /// The ranked groups + best for the MOVIE source set, read from `SourceListModel`'s published
+    /// output. The old per-body-eval assembly (streamGroups rebuild + merges + an O(N) signature
+    /// string over every stream) is gone: setContext is a handful of cheap reads behind an equality
+    /// guard, and the heavy assemble + rank happens off-main inside the model, once per real change.
     private func rankedMovie() -> (groups: [CoreStreamSourceGroup], best: CoreStream?) {
-        let raw = displayGroups(core.streamGroups())
-        let sig = raw.map { "\($0.id)#\($0.streams.count)" }.joined(separator: ",")
-            + "|pin:\(String(describing: sourcePin))|cache:\(debridCache.cachedHashes.sorted().joined(separator: ","))"
-            + "|kids:\(ProfileStore.activeIsKids() ? 1 : 0)|prefs:\(SourcePreferences.shared.rankingSignature)"
-            + "|remember:\(rememberedQuality ?? "-")"
-        return rankMemo.ranked(raw, signature: sig, pin: sourcePin,
-                               cached: debridCache.cachedHashes, continuity: rememberedQuality)
+        sourceList.setContext(metaId: id, streamId: nil, continuity: rememberedQuality, pin: sourcePin)
+        return (sourceList.groups, sourceList.best)
     }
 
-    /// The memoized ranked groups for the LIVE source set. Live ranks with continuity: nil (rankedGroups ignores
-    /// continuity, so groups are identical) on its own memo so it never folds in rememberedQuality. The `|live`
-    /// salt keeps its cache key distinct from the movie memo.
+    /// The ranked groups for the LIVE source set. rankedGroups ignores continuity, so the group order
+    /// is identical to the movie set's; live consumes only `groups` (never `best`), and a screen is
+    /// either the live page or the movie page, so the one model serves both without a cache clash.
     private func rankedLive() -> [CoreStreamSourceGroup] {
-        let raw = displayGroups(core.streamGroups())
-        let sig = raw.map { "\($0.id)#\($0.streams.count)" }.joined(separator: ",")
-            + "|pin:\(String(describing: sourcePin))|cache:\(debridCache.cachedHashes.sorted().joined(separator: ","))"
-            + "|kids:\(ProfileStore.activeIsKids() ? 1 : 0)|prefs:\(SourcePreferences.shared.rankingSignature)|live"
-        return liveRankMemo.ranked(raw, signature: sig, pin: sourcePin,
-                                   cached: debridCache.cachedHashes, continuity: nil).groups
+        sourceList.setContext(metaId: id, streamId: nil, continuity: nil, pin: sourcePin)
+        return sourceList.groups
     }
 
     /// The best source for the movie, honoring Direct-links-only and the remembered-quality continuity.
@@ -2007,8 +2004,10 @@ struct iOSDetailView: View {
         // false-cached row. Fail-soft: a nil race result falls straight through to the single-resolve on
         // `movieBest` below, so the no-key / no-cache path is byte-identical. (A manual source-row tap uses
         // `playStream`, which stays single-resolve on the exact chosen row.)
-        let candidates = StreamRanking.rankedGroups(displayGroups(core.streamGroups()), pin: sourcePin,
-                                                    debridCachedHashes: debridCache.cachedHashes).flatMap(\.streams)
+        // The model's published groups ARE StreamRanking.rankedGroups over the same inputs (and `stream`
+        // above is the model's `best`, so candidates and best stay consistent); re-ranking 1000+ streams
+        // synchronously on the main thread here was a press-time stall for no gain.
+        let candidates = rankedMovie().groups.flatMap(\.streams)
         if let win = await DebridCoordinator.shared.resolveFirstPlayable(
             candidates: candidates, cachedHashes: debridCache.cachedHashes,
             cachedUsenetURLs: debridCache.cachedUsenetURLs, labeledBest: stream) {
@@ -2273,6 +2272,7 @@ struct iOSDetailView: View {
             play: { stream, url in Task { await playLiveStream(stream, url: url) } },
             isSuspended: suspended
         )
+        .equatable()   // see sourceSection: skip re-diffing the list on unrelated re-renders
         .padding(.horizontal, Theme.Space.md)
     }
 
@@ -2621,9 +2621,10 @@ struct iOSEpisodeStreams: View {
     // player cover could stop Watch from presenting. One enum-typed slot guarantees exactly one cover.
     @State private var presentation: Presentation?
     @State private var preparing = false
-    /// Memoizes the episode source-list rank across body re-evaluations (mirror of the movie memo / tvOS fed79fc).
-    /// The episode body re-evaluates on every CoreBridge bump while its list is open; @State so it never publishes.
-    @State private var rankMemo = DetailRankMemo()
+    /// Owns this episode's source-list assembly + ranking OFF the SwiftUI render path (see
+    /// `SourceListModel`): the body reads only the published output, scoped to this episode's stream
+    /// id, so CoreBridge bumps while the list is open no longer rebuild it per body eval.
+    @StateObject private var sourceList = SourceListModel()
     @State private var lastBinge: String?   // release-group of the last pick; biases the next episode's source (#3 sticky autoplay)
     @State private var settleTimedOut = false      // resolution gave up → show "No sources found", not a spinner
     @State private var torrentPrime: Task<Void, Never>?  // outstanding torrent /create retry loop, cancelled on disappear / new pick
@@ -2680,6 +2681,9 @@ struct iOSEpisodeStreams: View {
                     download: episodeDownloadHandler,
                     isSuspended: presentation != nil
                 )
+                // Equatable gate: unrelated episode re-renders skip re-diffing the ranked list (the
+                // groups compare is a buffer-identity fast path until the model republishes).
+                .equatable()
                 .padding(.horizontal, Theme.Space.md)
                 // #9: cap the source list to a readable column, centered, on wide iPad/Mac windows.
                 .frame(maxWidth: geo.size.width > Theme.Space.wideLayoutMinWidth ? Theme.Space.contentColumn : .infinity)
@@ -2699,6 +2703,8 @@ struct iOSEpisodeStreams: View {
         // The engine loads per-episode streams on demand; trigger that load for THIS episode — but only
         // when the resident streams aren't already this episode's, so a back/forward revisit doesn't churn.
         .onAppear {
+            // Wire the source-list model to this episode's sources (idempotent; see SourceListModel).
+            sourceList.bind(core: core, torbox: torboxSearch, singularity: sourceIndex, debridCache: debridCache)
             // Load THIS episode's streams. The series meta is often ALREADY loaded (from the detail page)
             // WITHOUT this episode's stream path, so guarding on meta id alone skipped the stream request
             // entirely and the source list stayed empty ("no sources" / "no stream add-ons responded").
@@ -2997,17 +3003,13 @@ struct iOSEpisodeStreams: View {
         }
     }
 
-    /// Memoized ranked groups for the EPISODE source set (mirror of the movie memo / tvOS fed79fc). Folds the cheap
-    /// O(groups) signature incl. the episode id so a struct instance reused for another episode can't serve a stale
-    /// rank. iOSSourceList consumes only `groups` here, so returning .groups is sufficient.
+    /// The ranked groups for the EPISODE source set, read from `SourceListModel`'s published output.
+    /// The episode's stream id scopes the model's snapshot (streamGroups(forStreamId:)) so a struct
+    /// instance reused for another episode can't serve a stale rank; setContext is cheap and
+    /// equality-guarded, and the heavy assemble + rank runs off-main inside the model.
     private func rankedEpisode() -> [CoreStreamSourceGroup] {
-        let raw = displayGroups(core.streamGroups(forStreamId: video.id))
-        let sig = raw.map { "\($0.id)#\($0.streams.count)" }.joined(separator: ",")
-            + "|pin:\(String(describing: sourcePin))|cache:\(debridCache.cachedHashes.sorted().joined(separator: ","))"
-            + "|kids:\(ProfileStore.activeIsKids() ? 1 : 0)|prefs:\(SourcePreferences.shared.rankingSignature)"
-            + "|remember:\(rememberedQuality ?? "-")|ep:\(video.id)"
-        return rankMemo.ranked(raw, signature: sig, pin: sourcePin,
-                               cached: debridCache.cachedHashes, continuity: rememberedQuality).groups
+        sourceList.setContext(metaId: meta.id, streamId: video.id, continuity: rememberedQuality, pin: sourcePin)
+        return sourceList.groups
     }
 
     /// The episode's pool `content_id` (show imdb id + `:S:E`), or nil when the show has no imdb id.
@@ -3339,11 +3341,9 @@ struct iOSSourceList: View {
                     emptyState
                 }
             } else {
-                // PINNED Singularity: float the best few community-corroborated sources into a labeled section
-                // at the VERY top, above the quality-grouped add-on sources, so at least one Singularity source
-                // is always visible without scrolling past a popular title's thousands of add-on rows. The rest
-                // stay reachable under the normal "Singularity" add-on group / the All-sources list below.
-                singularitySection
+                // Singularity renders INLINE ONLY: its merged group flows through the ranked list like
+                // any add-on, sortable with the user's sort (owner decision; the old pinned duplicate
+                // section above the list was removed on both platforms).
                 if showsPrimaryControls { controlBar }
                 if loading && progress.total > 0 {
                     Text("Still finding more · \(progress.loaded)/\(progress.total) add-ons")
@@ -3464,46 +3464,6 @@ struct iOSSourceList: View {
             // Open the list in the sort the user last chose, and remember any change (per the Settings default).
             .onAppear { sortMode = SourceSort(key: SourcePreferences.shared.defaultSourceSort) }
             .onChange(of: sortMode) { newValue in SourcePreferences.shared.defaultSourceSort = newValue.key }
-        }
-    }
-
-    // MARK: Pinned Singularity section
-
-    /// The best few community-corroborated Singularity sources, sliced from the already-ranked `groups`, so
-    /// at least one Singularity-labeled source is ALWAYS visible at the top without scrolling, even on a
-    /// popular title whose add-ons return thousands of rows that would otherwise bury it. Capped at
-    /// `pinnedSectionMax`; the full set stays under the normal "Singularity" add-on group / All-sources list.
-    private var pinnedSingularity: [CoreStream] { SourceIndexClient.pinnedStreams(from: groups) }
-
-    /// A pinned, labeled "Singularity" section rendered at the very top of the list. Empty pool → nothing
-    /// renders (pure pass-through). Rows reuse `streamRow`, so they tap / pin / download exactly like any
-    /// other source and stay clearly labeled "Singularity".
-    @ViewBuilder private var singularitySection: some View {
-        let pinned = pinnedSingularity
-        if !pinned.isEmpty {
-            VStack(alignment: .leading, spacing: Theme.Space.sm) {
-                HStack(spacing: Theme.Space.sm) {
-                    Image(systemName: "sparkles")
-                        .font(.system(size: 13, weight: .semibold))
-                        .foregroundStyle(Theme.Palette.accent)
-                    Text(SourceIndexClient.groupAddon.uppercased())
-                        .font(Theme.Typography.eyebrow).tracking(1.5)
-                        .foregroundStyle(Theme.Palette.accent)
-                    Text("Community")
-                        .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textTertiary)
-                    Spacer(minLength: 0)
-                }
-                .padding(.horizontal, Theme.Space.md)
-                .padding(.vertical, Theme.Space.sm)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .background(Theme.Palette.accent.opacity(0.14),
-                            in: RoundedRectangle(cornerRadius: Theme.Radius.chip, style: .continuous))
-                .accessibilityElement(children: .combine)
-                .accessibilityLabel("Singularity community sources")
-                ForEach(Array(pinned.enumerated()), id: \.offset) { _, stream in
-                    streamRow(SourceIndexClient.groupAddon, stream)
-                }
-            }
         }
     }
 
@@ -3651,6 +3611,26 @@ struct iOSSourceList: View {
         let count = streamCount
         if count == 0 { return loading ? "Searching" : "None found" }
         return loading ? "\(count) so far" : "\(count) source\(count == 1 ? "" : "s")"
+    }
+}
+
+/// Equatable so `.equatable()` lets SwiftUI SKIP diffing the (potentially 1000+ row) list when an
+/// unrelated detail re-render passes identical inputs. The closures (play / download / ...) are
+/// deliberately excluded: they are recreated per parent eval but never change behavior. `groups`
+/// comes from `SourceListModel`'s published array, which stays the SAME instance until the model
+/// republishes, so the array compare is a buffer-identity fast path, not an element walk.
+extension iOSSourceList: Equatable {
+    static func == (lhs: iOSSourceList, rhs: iOSSourceList) -> Bool {
+        lhs.isSuspended == rhs.isSuspended
+            && lhs.settleTimedOut == rhs.settleTimedOut
+            && lhs.showsPrimaryControls == rhs.showsPrimaryControls
+            && lhs.progress == rhs.progress
+            && lhs.continuity == rhs.continuity
+            && lhs.pinContext == rhs.pinContext
+            && lhs.cachedHashes == rhs.cachedHashes
+            && lhs.cachedUsenetURLs == rhs.cachedUsenetURLs
+            && lhs.states == rhs.states
+            && lhs.groups == rhs.groups
     }
 }
 

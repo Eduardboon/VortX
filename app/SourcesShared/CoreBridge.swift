@@ -18,6 +18,13 @@ final class CoreBridge: ObservableObject {
     @Published private(set) var continueWatching: [CoreCWItem] = []
     @Published private(set) var boardRows: [CoreBoardRow] = []
     @Published private(set) var metaDetails: CoreMetaDetails?
+    /// Monotonic epoch of the READY-STREAM SET for the loaded meta. Bumps ONLY when the coalesced
+    /// `meta_details` republish actually changed the loaded meta id or the per-group ready-stream
+    /// signature (or on an explicit load/unload that cleared it), never on a library/progress-only
+    /// republish and never on the raw `revision` storm. `SourceListModel` keys its O(1) rebuild
+    /// signature on this instead of hashing every stream, so a source-search burst costs the source
+    /// list nothing until streams really changed. Main-queue writes only.
+    @Published private(set) var streamsEpoch = 0
     @Published private(set) var discover: CoreDiscover?
     @Published private(set) var library: CoreLibrary?
     @Published private(set) var searchResults: [CoreMeta] = []
@@ -797,29 +804,63 @@ final class CoreBridge: ObservableObject {
         // keep it when the requested meta is already ready, otherwise clear to the spinner until it loads.
         let current = decode(CoreMetaDetails.self, field: "meta_details")
         let alreadyLoaded = current?.meta?.id == id
-        DispatchQueue.main.async { [weak self] in self?.metaDetails = alreadyLoaded ? current : nil }
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            let hadDetails = self.metaDetails != nil
+            self.metaDetails = alreadyLoaded ? current : nil
+            // A fresh load clears the resident streams: that IS a ready-stream-set change, so the
+            // source-list epoch must bump (the model empties, then repaints as the new title lands).
+            if !alreadyLoaded, hadDetails { self.streamsEpoch &+= 1 }
+        }
     }
 
     func unloadMeta() {
         dispatch(action: ["action": "Unload"], field: "meta_details")
-        DispatchQueue.main.async { [weak self] in self?.metaDetails = nil }
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            if self.metaDetails != nil { self.streamsEpoch &+= 1 }
+            self.metaDetails = nil
+        }
     }
 
     /// Loaded streams grouped by their source addon (for the per-addon filter + source labels).
+    ///
+    /// TOMBSTONE SUBTRACTION (the streams half of the remove-add-on fix): `refreshAddons` enforces the
+    /// durable removal set on the add-on LIST surface, but the streams a deleted add-on had already
+    /// loaded into `meta_details` kept SERVING SOURCES here until the next stream load. Subtract any
+    /// group whose transport base is tombstoned, mirroring the refreshAddons filter, so a deleted
+    /// add-on's sources disappear from every open source list too.
     @MainActor
     func streamGroups() -> [CoreStreamSourceGroup] {
         guard let details = metaDetails else { return [] }
         let names = addonNamesByBase()
         let disabledAddons = ProfileStore.activeDisabledAddons()   // per-profile add-on set, hoisted once
+        let removed = AddonTombstones.all()                        // durable removal set, hoisted once
         var groups: [CoreStreamSourceGroup] = []
         for group in details.streams {
             guard !disabledAddons.contains(group.request.base) else { continue }
+            guard removed.isEmpty || !isTombstonedAddonBase(group.request.base, removed: removed) else { continue }
             guard let streams = group.content?.ready, !streams.isEmpty else { continue }
             groups.append(CoreStreamSourceGroup(id: group.request.base,
                                                 addon: names[group.request.base] ?? "Add-on",
                                                 streams: streams))
         }
         return groups
+    }
+
+    /// True when a stream group's source add-on (keyed by its transport base URL, which is the
+    /// descriptor's transportUrl) is in the durable removal tombstone set. Mirrors the refreshAddons
+    /// enforcement (CoreBridge.refreshAddons): official/protected add-ons are never subtracted, so a
+    /// malformed web-authored removal of a default can hide nothing, exactly like the list surface.
+    @MainActor
+    private func isTombstonedAddonBase(_ base: String, removed: Set<String>) -> Bool {
+        let key = AddonTombstones.normalize(base)
+        guard removed.contains(key) else { return false }
+        if let descriptor = addons.first(where: { AddonTombstones.normalize($0.transportUrl) == key }),
+           descriptor.isOfficial || descriptor.isProtected {
+            return false
+        }
+        return true
     }
 
     /// Stream-addon load progress: `total` = add-ons queried for this title's streams, `loaded` = those
@@ -847,9 +888,11 @@ final class CoreBridge: ObservableObject {
         guard let details = metaDetails else { return [] }
         let names = addonNamesByBase()
         let disabledAddons = ProfileStore.activeDisabledAddons()   // per-profile add-on set, hoisted once
+        let removed = AddonTombstones.all()                        // durable removal set (see streamGroups())
         var groups: [CoreStreamSourceGroup] = []
         for group in details.streams where group.request.path.id == streamId {
             guard !disabledAddons.contains(group.request.base) else { continue }
+            guard removed.isEmpty || !isTombstonedAddonBase(group.request.base, removed: removed) else { continue }
             guard let streams = group.content?.ready, !streams.isEmpty else { continue }
             groups.append(CoreStreamSourceGroup(id: group.request.base,
                                                 addon: names[group.request.base] ?? "Add-on",
@@ -879,7 +922,7 @@ final class CoreBridge: ObservableObject {
     /// the difference that explains "tvOS Lite finds links but iOS doesn't": if iOS gets `Err(Fetch …)`
     /// where Lite gets `Ready`, the network/transport is the culprit, not the add-on set. `EmptyContent`
     /// is reported as a non-error empty (the add-on genuinely had nothing for this title).
-    struct StreamAddonState: Identifiable {
+    struct StreamAddonState: Identifiable, Equatable {
         let base: String
         let name: String
         let ready: Int          // streams returned
@@ -888,32 +931,47 @@ final class CoreBridge: ObservableObject {
         var id: String { base }
     }
 
+    /// Memo for `streamAddonStates`, keyed per stream id on `streamsEpoch`: every fact it surfaces
+    /// (per-group ready count, loading flag, error transition) changes exactly when the ready-stream
+    /// signature changes, which is when `streamsEpoch` bumps. Without this, the three iOS source-list
+    /// call sites pulled the FULL raw meta_details JSON across the FFI and re-parsed it with
+    /// JSONSerialization on EVERY SwiftUI body eval (6-7x/sec during source search on a 1200+ stream
+    /// title), a main-thread saturator of its own alongside the old per-eval assembly.
+    private var addonStatesCache: [String: (epoch: Int, value: [StreamAddonState])] = [:]
+
     @MainActor
     func streamAddonStates(forStreamId streamId: String? = nil) -> [StreamAddonState] {
-        guard let data = stateData("meta_details"),
-              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let streams = object["streams"] as? [[String: Any]] else { return [] }
-        let names = addonNamesByBase()
+        let cacheKey = streamId ?? ""
+        if let hit = addonStatesCache[cacheKey], hit.epoch == streamsEpoch { return hit.value }
         var out: [StreamAddonState] = []
-        for group in streams {
-            let request = group["request"] as? [String: Any]
-            if let streamId,
-               let path = request?["path"] as? [String: Any],
-               path["id"] as? String != streamId { continue }
-            let base = request?["base"] as? String ?? ""
-            let name = names[base] ?? "Add-on"
-            let content = group["content"] as? [String: Any]
-            switch content?["type"] as? String {
-            case "Ready":
-                let n = (content?["content"] as? [[String: Any]])?.count ?? 0
-                out.append(.init(base: base, name: name, ready: n, loading: false, error: nil))
-            case "Err":
-                let msg = Self.describeResourceError(content?["content"])
-                out.append(.init(base: base, name: name, ready: 0, loading: false, error: msg))
-            default:
-                out.append(.init(base: base, name: name, ready: 0, loading: true, error: nil))
+        if let data = stateData("meta_details"),
+           let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+           let streams = object["streams"] as? [[String: Any]] {
+            let names = addonNamesByBase()
+            for group in streams {
+                let request = group["request"] as? [String: Any]
+                if let streamId,
+                   let path = request?["path"] as? [String: Any],
+                   path["id"] as? String != streamId { continue }
+                let base = request?["base"] as? String ?? ""
+                let name = names[base] ?? "Add-on"
+                let content = group["content"] as? [String: Any]
+                switch content?["type"] as? String {
+                case "Ready":
+                    let n = (content?["content"] as? [[String: Any]])?.count ?? 0
+                    out.append(.init(base: base, name: name, ready: n, loading: false, error: nil))
+                case "Err":
+                    let msg = Self.describeResourceError(content?["content"])
+                    out.append(.init(base: base, name: name, ready: 0, loading: false, error: msg))
+                default:
+                    out.append(.init(base: base, name: name, ready: 0, loading: true, error: nil))
+                }
             }
         }
+        // Bounded: a long episode-hopping session accumulates one slot per episode id; reset on overflow
+        // (worst case one extra parse). Failures cache too, so a broken payload cannot re-parse per eval.
+        if addonStatesCache.count > 8 { addonStatesCache.removeAll(keepingCapacity: true) }
+        addonStatesCache[cacheKey] = (streamsEpoch, out)
         return out
     }
 
@@ -1586,7 +1644,13 @@ final class CoreBridge: ObservableObject {
                     DispatchQueue.main.async { [weak self] in
                         guard let self else { return }
                         if Self.metaDetailsNeedsRepublish(current: self.metaDetails, next: details) {
+                            // Compute the streams-only diff BEFORE the assignment, then bump the
+                            // source-list epoch only when the ready-stream set (or the loaded meta)
+                            // really changed, so a library/progress-only republish never triggers a
+                            // source-list rebuild.
+                            let streamsChanged = Self.metaDetailsStreamsChanged(current: self.metaDetails, next: details)
                             self.metaDetails = details
+                            if streamsChanged { self.streamsEpoch &+= 1 }
                         }
                     }
                 }
@@ -1621,6 +1685,16 @@ final class CoreBridge: ObservableObject {
             || (current.watchedVideoIds?.count ?? 0) != (next.watchedVideoIds?.count ?? 0) {
             return true
         }
+        return streamSetSignature(current.streams) != streamSetSignature(next.streams)
+    }
+
+    /// True when a republish changed something the SOURCE LIST derives from: presence, the loaded
+    /// meta id, or the per-group ready-stream signature. Library/watched/progress-only republishes
+    /// return false, so `streamsEpoch` (the source-list rebuild key) never bumps on a ~20s progress
+    /// save while the stream set is unchanged.
+    private static func metaDetailsStreamsChanged(current: CoreMetaDetails?, next: CoreMetaDetails?) -> Bool {
+        guard let current, let next else { return (current != nil) != (next != nil) }
+        if current.meta?.id != next.meta?.id { return true }
         return streamSetSignature(current.streams) != streamSetSignature(next.streams)
     }
 

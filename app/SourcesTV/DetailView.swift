@@ -1417,7 +1417,6 @@ struct CoreStreamList: View {
     @FocusState private var watchFocused: Bool
     @EnvironmentObject private var presenter: PlayerPresenter   // root-replacement player presentation
     @ObservedObject private var pinStore = SourcePinStore.shared   // pinned source floats to top + row menu/badge (#15)
-    @AppStorage(PlaybackSettings.Key.directLinksOnly) private var directLinksOnly = false
     // Debrid cache AWARENESS: which raw torrents the user's debrid account has cached, so they badge +
     // rank up. Empty (no badges, ranking unchanged) with no debrid key configured.
     @StateObject private var debridCache = DebridCacheAwareness()
@@ -1459,9 +1458,12 @@ struct CoreStreamList: View {
         return secs >= 1 ? secs : nil
     }
 
-    /// Caches the expensive rankedGroups + best computation across body re-evaluations (see DetailRankMemo).
-    /// @State (not @StateObject) on purpose: the cache must NOT publish or it would re-render on every hit.
-    @State private var rankMemo = DetailRankMemo()
+    /// Owns the source-list assembly + ranking OFF the SwiftUI render path (see `SourceListModel`):
+    /// snapshot -> merge -> tombstone subtraction -> direct-links filter -> rank, coalesced at ~250 ms
+    /// and run off-main, publishing once per real change. This body reads only the published output,
+    /// so the CoreBridge revision storm during source search costs it nothing (the earlier
+    /// DetailRankMemo cached only the rank and still re-assembled + re-signed per body eval).
+    @StateObject private var sourceList = SourceListModel()
 
     var body: some View {
         // While the player is up the tvOS shell stays MOUNTED behind it (RootView renders the player over an
@@ -1478,21 +1480,14 @@ struct CoreStreamList: View {
         // whatever this title played last (per profile), so a series you watch in a
         // specific quality keeps opening in it. Cached/instant still outranks it.
         let remembered = meta.flatMap { LastStreamStore.entry(for: $0.libraryId, profileID: ProfileStore.shared.activeID)?.qualityText }
-        // Memoize the expensive rank + best over the raw stream set. This body re-evaluates on EVERY CoreBridge
-        // @Published bump while the source list is open (progress ticks, the settle timer, debrid cache-check
-        // results), and re-sorting a 1000+ stream list each time starved the tvOS main thread (the source-list
-        // jank owner + @jbecker-it hit). The signature is O(groups), not O(streams), and invalidates on the only
-        // inputs that change the order: the stream set, the pin, the debrid cached-hash set, the ranking
-        // preferences, and the Kids content guard. displayGroups is a cheap merge/filter, kept outside the memo.
-        let raw = displayGroups(core.streamGroups())
-        let rankSig = raw.map { "\($0.id)#\($0.streams.count)" }.joined(separator: ",")
-            + "|pin:\(String(describing: sourcePin))|cache:\(debridCache.cachedHashes.sorted().joined(separator: ","))"
-            + "|kids:\(ProfileStore.activeIsKids() ? 1 : 0)|prefs:\(SourcePreferences.shared.rankingSignature)"
-            + "|remember:\(remembered ?? "-")"
-        let ranked = rankMemo.ranked(raw, signature: rankSig, pin: sourcePin,
-                                     cached: debridCache.cachedHashes, continuity: remembered)
-        let groups = ranked.groups                                   // best source first within each add-on
-        let best = ranked.best
+        // Read the ranked list from the SourceListModel's published output. This body still re-evaluates
+        // on every CoreBridge @Published bump while the list is open, but each eval is now a couple of
+        // published-array reads: the assembly (merges + tombstones + direct-links filter) AND the rank
+        // both run off-main inside the model, coalesced to at most ~4 rebuilds/sec. setContext is a few
+        // cheap reads behind an equality guard, safe from body.
+        sourceList.setContext(metaId: meta?.libraryId ?? "", streamId: nil, continuity: remembered, pin: sourcePin)
+        let groups = sourceList.groups                               // best source first within each add-on
+        let best = sourceList.best
         let streamCount = groups.reduce(0) { $0 + $1.streams.count }
         let visible = groups.filter { sourceFilter == nil || $0.addon == sourceFilter }
         let addons = core.streamLoadProgress()                       // (loaded, total) stream add-ons
@@ -1504,12 +1499,9 @@ struct CoreStreamList: View {
         let watchReady = !loadingAddons || settleTimedOut
 
         return AnyView(VStack(alignment: .leading, spacing: Theme.Space.md) {
-            // PINNED Singularity: the best few community-corroborated sources floated to the top, matching iOS
-            // (iOSDetailView pins its singularitySection too). Empty pool -> nothing renders (pure pass-through);
-            // the full Singularity set still lives in the "All sources" list below. NOTE: 0.3.11 briefly removed
-            // this on tvOS ONLY, which buried Singularity at the bottom of the collapsed source list while iOS
-            // kept its pinned section. Restored for true iOS parity.
-            singularitySection(groups)
+            // Singularity renders INLINE ONLY: its merged group flows through the ranked list like any
+            // add-on, sortable with the user's sort (owner decision; the pinned duplicate section that
+            // floated an unsortable top-6 above the list was removed on both platforms).
             if let best {
                 // Watch-Now first: one press plays the best source; long-press picks another resolution;
                 // the full ranked list stays tucked behind "All sources".
@@ -1653,8 +1645,13 @@ struct CoreStreamList: View {
             refreshSourceIndex()   // SERVE + HOARD the community source index as more sources answer
         }
         // TorBox search-as-a-source: fetch the extra usenet/torrent sources (gated on a TorBox key + de-duped
-        // by imdb id inside refresh). Live channels pass nil, so this no-ops for them.
-        .onAppear { torboxSearch.refresh(imdbId: imdbId); refreshSourceIndex() }
+        // by imdb id inside refresh). Live channels pass nil, so this no-ops for them. Also wires the
+        // source-list model to this screen's sources (idempotent; nudges a refresh on re-appear).
+        .onAppear {
+            sourceList.bind(core: core, torbox: torboxSearch, singularity: sourceIndex, debridCache: debridCache)
+            torboxSearch.refresh(imdbId: imdbId)
+            refreshSourceIndex()
+        }
         // First-download storage-eviction warning (#30). Apple TV has no user-visible file system and the
         // OS can reclaim app storage under pressure, so a saved download may be removed by the system. Show
         // this once; on confirm we remember the ack and run the queued download, on cancel we drop it.
@@ -1742,19 +1739,6 @@ struct CoreStreamList: View {
     @ViewBuilder private func resolutionMenu(_ groups: [CoreStreamSourceGroup]) -> some View {
         ForEach(StreamRanking.resolutionOptions(groups), id: \.label) { opt in
             Button { play(opt.stream) } label: { Label("Watch in \(opt.label)", systemImage: "play.fill") }
-        }
-    }
-
-    private func displayGroups(_ groups: [CoreStreamSourceGroup]) -> [CoreStreamSourceGroup] {
-        // Merge the TorBox search sources first (no-op with no TorBox key / no results), then the community
-        // source-index sources (no-op unless the Singularity toggle is on + signed in), then apply the
-        // Direct-links-only filter so a search/community source is filtered on the same rule as an add-on's.
-        let withSearch = sourceIndex.merged(into: torboxSearch.merged(into: groups))
-        guard directLinksOnly else { return withSearch }
-        return withSearch.compactMap { group in
-            let streams = group.streams.filter { !$0.isTorrent }
-            guard !streams.isEmpty else { return nil }
-            return CoreStreamSourceGroup(id: group.id, addon: group.addon, streams: streams)
         }
     }
 
@@ -1919,30 +1903,6 @@ struct CoreStreamList: View {
                 }
             }
             .padding(.vertical, Theme.Space.xs)
-        }
-    }
-
-    /// A pinned, labeled "Singularity" section at the top of the source list (matches iOSDetailView, which pins
-    /// its own). Shows the best few community-corroborated Singularity sources (sliced from the already-ranked
-    /// `groups`, best-first). Empty pool -> nothing renders (pure pass-through). Rows reuse `streamRow`.
-    @ViewBuilder private func singularitySection(_ groups: [CoreStreamSourceGroup]) -> some View {
-        let pinned = SourceIndexClient.pinnedStreams(from: groups)
-        if !pinned.isEmpty {
-            VStack(alignment: .leading, spacing: Theme.Space.sm) {
-                HStack(spacing: Theme.Space.sm) {
-                    Image(systemName: "sparkles").font(.system(size: 20, weight: .semibold))
-                        .foregroundStyle(Theme.Palette.accent)
-                    Text(SourceIndexClient.groupAddon.uppercased())
-                        .font(Theme.Typography.eyebrow).tracking(1.5)
-                        .foregroundStyle(Theme.Palette.accent)
-                    Text("Community").font(Theme.Typography.label)
-                        .foregroundStyle(Theme.Palette.textTertiary)
-                }
-                .padding(.horizontal, Theme.Space.md)
-                ForEach(Array(pinned.enumerated()), id: \.offset) { _, stream in
-                    streamRow(SourceIndexClient.groupAddon, stream)
-                }
-            }
         }
     }
 
