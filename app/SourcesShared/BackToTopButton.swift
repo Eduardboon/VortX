@@ -30,24 +30,33 @@ extension View {
     /// Place near the TOP of a scroll column (e.g. right after the hero). While it is on screen the
     /// back-to-top button stays hidden; once the `LazyVStack` recycles it (you have scrolled the top away)
     /// the button appears. Give it real (non-zero) height so appear/disappear fire cleanly.
-    func backToTopMarker(key: String) -> some View {
+    ///
+    /// `active` MUST be the owning tab's `isActive`. The tab shell keeps every visited screen mounted and
+    /// laid out (opacity-switched, so `onDisappear` never fires on a tab switch); a hidden screen's
+    /// `LazyVStack` can still re-realize its top region on a re-layout (content republish, Dynamic Type)
+    /// and fire this marker's `onAppear`/`onDisappear`. Gating the writes on `active` keeps a hidden screen
+    /// from corrupting its own key against what the user will see when they return.
+    func backToTopMarker(key: String, active: Bool) -> some View {
         Color.clear
             .frame(height: 1)
-            .onAppear { BackToTopVisibility.shared.set(key, false) }
-            .onDisappear { BackToTopVisibility.shared.set(key, true) }
+            .onAppear { if active { BackToTopVisibility.shared.set(key, false) } }
+            .onDisappear { if active { BackToTopVisibility.shared.set(key, true) } }
             .accessibilityHidden(true)
     }
 }
 
 private struct BackToTopButton: ViewModifier {
     let key: String     // one of TabScrollKeys.*
+    let active: Bool    // the owning tab is the visible one AND showing its normal scrollable content
     let bottomInset: CGFloat   // clearance so the button floats ABOVE the bottom tab bar
 
     @ObservedObject private var visibility = BackToTopVisibility.shared
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     func body(content: Content) -> some View {
-        let shown = visibility.isShown(key)
+        // Gate on `active` too, so a stale latch on a hidden/opacity-0 screen (or a screen swapped to a
+        // different mode, e.g. Discover's inline-search results) never shows a wrong or misplaced button.
+        let shown = active && visibility.isShown(key)
         content
             .overlay(alignment: .bottomTrailing) {
                 if shown {
@@ -74,9 +83,12 @@ private struct BackToTopButton: ViewModifier {
 
 extension View {
     /// Add a floating back-to-top button to a scroll screen. Apply to the `ScrollView` (or a wrapper); the
-    /// screen must place `.backToTopMarker(key:)` near the top of its content and already use
-    /// `.scrollToTopOnBump(key)` (the button reuses that path). `bottomInset` lifts it clear of the tab bar.
-    func backToTopButton(key: String, bottomInset: CGFloat = 96) -> some View {
-        modifier(BackToTopButton(key: key, bottomInset: bottomInset))
+    /// screen must place `.backToTopMarker(key:active:)` near the top of its content and already use
+    /// `.scrollToTopOnBump(key)` (the button reuses that path). Pass `active` = the tab is the visible one
+    /// AND showing its scrollable browse content (false while a different mode, e.g. inline search, is up).
+    /// `bottomInset` lifts it clear of the tab bar. iOS / macOS only: the FAB has no focus wiring, so it is
+    /// never applied on tvOS (all call sites live in SourcesiOS, which tvOS targets do not compile).
+    func backToTopButton(key: String, active: Bool, bottomInset: CGFloat = 96) -> some View {
+        modifier(BackToTopButton(key: key, active: active, bottomInset: bottomInset))
     }
 }

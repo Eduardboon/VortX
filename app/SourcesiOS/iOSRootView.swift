@@ -577,7 +577,8 @@ struct iOSHomeView: View {
                     FeaturedHeroView(model: hero, onOpen: { path.append($0) })
                     // Once this marker (just below the hero) scrolls out of view, the floating
                     // back-to-top button appears; it hides again when you return to the top (#8).
-                    Color.clear.frame(height: 0).backToTopMarker(key: TabScrollKeys.home)
+                    // `active: isActive` keeps a hidden (opacity-switched) Home from writing stale state.
+                    Color.clear.frame(height: 0).backToTopMarker(key: TabScrollKeys.home, active: isActive)
                     if !continueWatchingItems.isEmpty {
                         // A CW card tap resumes the exact last-played stream straight into the player
                         // (#11), falling back to opening detail when no remembered link fits. Long-press
@@ -676,7 +677,7 @@ struct iOSHomeView: View {
             .scrollToTopOnBump(TabScrollKeys.home)
             // A floating back-to-top button appears once you scroll past the fold (#8); it bumps the same
             // signal as a tab re-tap, so it shares the anchor and animation above.
-            .backToTopButton(key: TabScrollKeys.home)
+            .backToTopButton(key: TabScrollKeys.home, active: isActive)
             #if os(macOS)
             // Arrow keys MOVE the keyboard-browse selection. These live on the ScrollView (not the
             // NavigationStack) because on macOS the inner ScrollView is first responder and swallows arrow
@@ -1523,7 +1524,8 @@ struct iOSDiscoverView: View {
                     } else {
                     FeaturedHeroView(model: hero, onOpen: { path.append($0) })
                     // Below the hero: once this marker scrolls away the back-to-top button appears (#8).
-                    Color.clear.frame(height: 0).backToTopMarker(key: TabScrollKeys.discover)
+                    // This marker lives only in the browse branch, so `active: isActive` suffices here.
+                    Color.clear.frame(height: 0).backToTopMarker(key: TabScrollKeys.discover, active: isActive)
                     if showCollectionsHub, CollectionsHubModel.isAvailable {
                         iOSCollectionsHub(model: collectionsHub)
                     }
@@ -1573,7 +1575,10 @@ struct iOSDiscoverView: View {
             // Re-tapping the active Discover tab scrolls back to the top.
             .scrollToTopOnBump(TabScrollKeys.discover)
             // Floating back-to-top button once you scroll past the fold (#8); bumps the same signal.
-            .backToTopButton(key: TabScrollKeys.discover)
+            // Suppressed while the inline-search results are up (that mode drops the browse marker), so the
+            // button can't strand over search results.
+            .backToTopButton(key: TabScrollKeys.discover,
+                             active: isActive && !(mergeDiscoverSearch && hasSearchQuery))
             .background(Theme.Palette.canvas.ignoresSafeArea())
             .stremioWordmarkTitle(String(localized: "Discover"), isActive: isActive)
             .navigationDestination(for: FeaturedHeroItem.self) { item in
