@@ -987,7 +987,7 @@ struct TVPlayerView: View {
     private var optionRows: [OptionRow] {
         switch panelKind {
         case .audio:
-            var rows = groupedTrackRows(audioTracks) { coordinator.player?.setAudioTrack($0); refreshTracksSoon() }
+            var rows = groupedTrackRows(audioTracks) { id in optimisticSelect(type: "audio", id: id); coordinator.player?.setAudioTrack(id); refreshTracksSoon() }
             rows.append(OptionRow(label: String(localized: "Audio Settings"), detail: "›") { openPanel(.audioSettings) })
             return rows
         case .audioSettings:
@@ -999,10 +999,12 @@ struct TVPlayerView: View {
             return rows
         case .subtitles:
             var rows = [OptionRow(label: String(localized: "Off"), isSelected: subtitleTracks.allSatisfy { !$0.selected }) {
+                optimisticSelect(type: "sub", id: -1)
                 coordinator.player?.setSubtitleTrack(-1); refreshTracksSoon()
                 VXProbe.event("subs", "subs selected off")
             }]
             rows += groupedTrackRows(subtitleTracks) { id in
+                optimisticSelect(type: "sub", id: id)
                 coordinator.player?.setSubtitleTrack(id); refreshTracksSoon()
                 let lang = subtitleTracks.first { $0.id == id }.map { langName($0.lang) } ?? "\(id)"
                 VXProbe.event("subs", "subs selected \(lang)")
@@ -1696,6 +1698,17 @@ struct TVPlayerView: View {
     }
     private func refreshTracksSoon() {
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { refreshTracks() }
+    }
+
+    /// Reflect a track choice in the panel IMMEDIATELY, before mpv confirms on the next refreshTracksSoon re-read
+    /// (a ~0.25s round trip), so the checkmark moves on tap instead of a beat later. id = the chosen track
+    /// (-1 = subtitles off). refreshTracksSoon reconciles from mpv's real track-list right after.
+    private func optimisticSelect(type: String, id: Int) {
+        func remap(_ tracks: [MPVTrack]) -> [MPVTrack] {
+            tracks.map { MPVTrack(id: $0.id, type: $0.type, title: $0.title, lang: $0.lang, selected: $0.id == id) }
+        }
+        if type == "audio" { audioTracks = remap(audioTracks) } else { subtitleTracks = remap(subtitleTracks) }
+        if showOptions { panelRows = optionRows }
     }
 
     /// Auto-pick the audio + subtitle track from the user's language preferences, once tracks are known.
