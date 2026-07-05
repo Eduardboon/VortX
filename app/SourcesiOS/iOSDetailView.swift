@@ -214,6 +214,12 @@ struct iOSDetailView: View {
     // always presents reliably. The player-cover variant sizes its content to fill the macOS window.
     @State private var presentation: Presentation?
     @State private var preparing = false                 // movie Watch Now is resolving
+    /// Caches the expensive rankedGroups + best across body re-evaluations (see DetailRankMemo). @State (not
+    /// @StateObject): the cache must NOT publish or it would re-render on every hit. The movie body computes the
+    /// rank in THREE places (movieBest, watchNow, sourceSection); one memo collapses them to a single rank.
+    @State private var rankMemo = DetailRankMemo()
+    /// Separate memo for the LIVE list (it ranks with continuity: nil, so it must not share the movie memo's cache).
+    @State private var liveRankMemo = DetailRankMemo()
     @State private var season = 1
     @State private var settleTimedOut = false            // movie/live resolution gave up → "No sources found", not a spinner
     // Debrid cache AWARENESS for the movie/live source list: which raw torrents the user's debrid account
@@ -1422,8 +1428,7 @@ struct iOSDetailView: View {
     /// **Sources** button (scrolls to the grouped per-add-on list below), and **Add to Library**,
     /// plus the trailer chip when one exists. Wraps onto a second line on a narrow phone.
     @ViewBuilder private func watchNow(scrollToSources: @escaping () -> Void) -> some View {
-        let groups = StreamRanking.rankedGroups(displayGroups(core.streamGroups()), pin: sourcePin,
-                                                debridCachedHashes: debridCache.cachedHashes)
+        let groups = rankedMovie().groups
         let sourceTotal = groups.reduce(0) { $0 + $1.streams.count }
         // FlowLayout so the action chips wrap to a new line on a narrow phone instead of compressing into
         // vertical slivers ("Sou / rce") under the hero's hard width cap.
@@ -1536,8 +1541,7 @@ struct iOSDetailView: View {
         // behind the video. The list restores unchanged on player close (presentation flips back to nil).
         let suspended = presentation != nil
         iOSSourceList(
-            groups: suspended ? [] : StreamRanking.rankedGroups(displayGroups(core.streamGroups()), pin: sourcePin,
-                                               debridCachedHashes: debridCache.cachedHashes),
+            groups: suspended ? [] : rankedMovie().groups,
             progress: core.streamLoadProgress(),
             states: core.streamAddonStates(),
             settleTimedOut: settleTimedOut,
@@ -1841,10 +1845,35 @@ struct iOSDetailView: View {
         return LastStreamStore.entry(for: m.id, profileID: ProfileStore.shared.activeID)?.qualityText
     }
 
+    /// The memoized ranked groups + best for the MOVIE source set. Folds the cheap O(groups) signature (stream
+    /// set id#count, pin, debrid cache contents, Kids guard, ranking prefs, remembered quality) so an unrelated
+    /// CoreBridge bump reuses the last rank instead of re-sorting a 1000+ stream list. Mirrors tvOS fed79fc and
+    /// collapses the movie body's three rank sites (movieBest, watchNow, sourceSection) to a single rank per pass.
+    private func rankedMovie() -> (groups: [CoreStreamSourceGroup], best: CoreStream?) {
+        let raw = displayGroups(core.streamGroups())
+        let sig = raw.map { "\($0.id)#\($0.streams.count)" }.joined(separator: ",")
+            + "|pin:\(String(describing: sourcePin))|cache:\(debridCache.cachedHashes.sorted().joined(separator: ","))"
+            + "|kids:\(ProfileStore.activeIsKids() ? 1 : 0)|prefs:\(SourcePreferences.shared.rankingSignature)"
+            + "|remember:\(rememberedQuality ?? "-")"
+        return rankMemo.ranked(raw, signature: sig, pin: sourcePin,
+                               cached: debridCache.cachedHashes, continuity: rememberedQuality)
+    }
+
+    /// The memoized ranked groups for the LIVE source set. Live ranks with continuity: nil (rankedGroups ignores
+    /// continuity, so groups are identical) on its own memo so it never folds in rememberedQuality. The `|live`
+    /// salt keeps its cache key distinct from the movie memo.
+    private func rankedLive() -> [CoreStreamSourceGroup] {
+        let raw = displayGroups(core.streamGroups())
+        let sig = raw.map { "\($0.id)#\($0.streams.count)" }.joined(separator: ",")
+            + "|pin:\(String(describing: sourcePin))|cache:\(debridCache.cachedHashes.sorted().joined(separator: ","))"
+            + "|kids:\(ProfileStore.activeIsKids() ? 1 : 0)|prefs:\(SourcePreferences.shared.rankingSignature)|live"
+        return liveRankMemo.ranked(raw, signature: sig, pin: sourcePin,
+                                   cached: debridCache.cachedHashes, continuity: nil).groups
+    }
+
     /// The best source for the movie, honoring Direct-links-only and the remembered-quality continuity.
     private var movieBest: CoreStream? {
-        StreamRanking.best(displayGroups(core.streamGroups()), continuity: rememberedQuality, pin: sourcePin,
-                           debridCachedHashes: debridCache.cachedHashes)
+        rankedMovie().best
     }
 
     /// Whether stream add-ons are still answering for this movie. Mirrors the tvOS Watch-Now gate:
@@ -2207,8 +2236,7 @@ struct iOSDetailView: View {
         // pass an empty list, so the hidden live detail stops re-rendering behind the video.
         let suspended = presentation != nil
         iOSSourceList(
-            groups: suspended ? [] : StreamRanking.rankedGroups(displayGroups(core.streamGroups()), pin: sourcePin,
-                                               debridCachedHashes: debridCache.cachedHashes),
+            groups: suspended ? [] : rankedLive(),
             progress: core.streamLoadProgress(),
             states: core.streamAddonStates(),
             settleTimedOut: settleTimedOut,
@@ -2563,6 +2591,9 @@ struct iOSEpisodeStreams: View {
     // player cover could stop Watch from presenting. One enum-typed slot guarantees exactly one cover.
     @State private var presentation: Presentation?
     @State private var preparing = false
+    /// Memoizes the episode source-list rank across body re-evaluations (mirror of the movie memo / tvOS fed79fc).
+    /// The episode body re-evaluates on every CoreBridge bump while its list is open; @State so it never publishes.
+    @State private var rankMemo = DetailRankMemo()
     @State private var lastBinge: String?   // release-group of the last pick; biases the next episode's source (#3 sticky autoplay)
     @State private var settleTimedOut = false      // resolution gave up → show "No sources found", not a spinner
     @State private var torrentPrime: Task<Void, Never>?  // outstanding torrent /create retry loop, cancelled on disappear / new pick
@@ -2605,8 +2636,7 @@ struct iOSEpisodeStreams: View {
                 // While the episode's player/trailer cover is up, skip the rankedGroups pass (pass [] +
                 // isSuspended) so this hidden episode list stops re-rendering behind the video. Restores on close.
                 iOSSourceList(
-                    groups: presentation != nil ? [] : StreamRanking.rankedGroups(displayGroups(core.streamGroups(forStreamId: video.id)), pin: sourcePin,
-                                                       debridCachedHashes: debridCache.cachedHashes),
+                    groups: presentation != nil ? [] : rankedEpisode(),
                     progress: core.streamLoadProgress(forStreamId: video.id),
                     states: core.streamAddonStates(forStreamId: video.id),
                     settleTimedOut: settleTimedOut,
@@ -2935,6 +2965,19 @@ struct iOSEpisodeStreams: View {
             guard !streams.isEmpty else { return nil }
             return CoreStreamSourceGroup(id: group.id, addon: group.addon, streams: streams)
         }
+    }
+
+    /// Memoized ranked groups for the EPISODE source set (mirror of the movie memo / tvOS fed79fc). Folds the cheap
+    /// O(groups) signature incl. the episode id so a struct instance reused for another episode can't serve a stale
+    /// rank. iOSSourceList consumes only `groups` here, so returning .groups is sufficient.
+    private func rankedEpisode() -> [CoreStreamSourceGroup] {
+        let raw = displayGroups(core.streamGroups(forStreamId: video.id))
+        let sig = raw.map { "\($0.id)#\($0.streams.count)" }.joined(separator: ",")
+            + "|pin:\(String(describing: sourcePin))|cache:\(debridCache.cachedHashes.sorted().joined(separator: ","))"
+            + "|kids:\(ProfileStore.activeIsKids() ? 1 : 0)|prefs:\(SourcePreferences.shared.rankingSignature)"
+            + "|remember:\(rememberedQuality ?? "-")|ep:\(video.id)"
+        return rankMemo.ranked(raw, signature: sig, pin: sourcePin,
+                               cached: debridCache.cachedHashes, continuity: rememberedQuality).groups
     }
 
     /// The episode's pool `content_id` (show imdb id + `:S:E`), or nil when the show has no imdb id.

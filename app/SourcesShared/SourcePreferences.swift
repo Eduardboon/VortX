@@ -178,7 +178,11 @@ final class SourcePreferences: ObservableObject {
          String(maxResolution),
          String(maxFileSizeGB),
          hdrOnly ? "1" : "0",
-         excludeAV1 ? "1" : "0"].joined(separator: "|")
+         excludeAV1 ? "1" : "0",
+         // Preferred audio languages live in TrackPreferences (a separate UserDefaults key), but the ranker's
+         // score() reads them via languageScore -> a -5000 foreign-audio demotion that reorders results. Fold them
+         // in so the detail memo invalidates when the viewer changes preferred audio language.
+         TrackPreferences.current.audioLanguages.joined(separator: ",")].joined(separator: "|")
     }
 
     /// Parsed, lowercased, non-empty exclude / include terms (substring mode).

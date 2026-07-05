@@ -1129,6 +1129,14 @@ struct CoreSeasonedEpisodes: View {
             recomputeEpisodes()
         }
         .onChange(of: season) { recomputeEpisodes() }
+        // A series' `videos` often stream in AFTER this panel first renders, so the season/episode lists built
+        // on first appear can be stale or empty. Rebuild them when the videos array grows, keeping the selected
+        // season valid.
+        .onChange(of: videos.count) {
+            recomputeSeasons()
+            if !seasons.contains(season) { season = seasons.first { $0 > 0 } ?? seasons.first ?? 1 }
+            recomputeEpisodes()
+        }
     }
 
     private var firstUnwatchedSeason: Int? {
@@ -1453,7 +1461,7 @@ struct CoreStreamList: View {
         // preferences, and the Kids content guard. displayGroups is a cheap merge/filter, kept outside the memo.
         let raw = displayGroups(core.streamGroups())
         let rankSig = raw.map { "\($0.id)#\($0.streams.count)" }.joined(separator: ",")
-            + "|pin:\(String(describing: sourcePin))|cache:\(debridCache.cachedHashes.count)"
+            + "|pin:\(String(describing: sourcePin))|cache:\(debridCache.cachedHashes.sorted().joined(separator: ","))"
             + "|kids:\(ProfileStore.activeIsKids() ? 1 : 0)|prefs:\(SourcePreferences.shared.rankingSignature)"
             + "|remember:\(remembered ?? "-")"
         let ranked = rankMemo.ranked(raw, signature: rankSig, pin: sourcePin,
@@ -2109,28 +2117,5 @@ private struct CastMemberCard: View {
         .frame(width: 140, height: 140)
         .clipShape(Circle())
         .overlay(Circle().strokeBorder(Theme.Palette.textPrimary.opacity(focused ? 0.3 : 0.08), lineWidth: focused ? 3 : 1))
-    }
-}
-
-/// Memoizes DetailView's ranked-groups + best across body re-evaluations. The detail body re-evaluates on
-/// every CoreBridge @Published bump while the source list is open, and re-ranking a 1000+ stream list each
-/// time starved the tvOS main thread. This recomputes only when the caller's signature (a cheap O(groups)
-/// fingerprint of the stream set + pin + debrid cache + ranking prefs) changes; otherwise it returns the last
-/// result untouched. Held by DetailView as @State so mutating these fields never goes through the @State setter
-/// (no "modifying state during view update") and fires no objectWillChange (no re-render loop). Main-actor
-/// because it is only ever touched from `body`.
-@MainActor final class DetailRankMemo {
-    private var signature = ""
-    private var cachedGroups: [CoreStreamSourceGroup] = []
-    private var cachedBest: CoreStream?
-
-    func ranked(_ raw: [CoreStreamSourceGroup], signature sig: String, pin: ResolvedPin?,
-                cached: Set<String>, continuity: String?) -> (groups: [CoreStreamSourceGroup], best: CoreStream?) {
-        if sig != signature {
-            signature = sig
-            cachedGroups = StreamRanking.rankedGroups(raw, pin: pin, debridCachedHashes: cached)
-            cachedBest = StreamRanking.best(cachedGroups, continuity: continuity, pin: pin, debridCachedHashes: cached)
-        }
-        return (cachedGroups, cachedBest)
     }
 }
