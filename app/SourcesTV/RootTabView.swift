@@ -93,8 +93,8 @@ struct RootView: View {
                 TVPlayerView(url: req.url, title: req.title, meta: req.meta, episodes: req.episodes,
                              sourceHint: req.sourceHint, torrent: req.torrent, bingeGroup: req.bingeGroup,
                              headers: req.headers, forceMPV: req.forceMPV, isTrailer: req.isTrailer,
-                             audioSidecarURL: req.audioSidecarURL, startedFromExplicitPick: req.wasExplicitPick,
-                             startedFromResume: req.wasResume,
+                             audioSidecarURL: req.audioSidecarURL, debridRef: req.debridRef,
+                             startedFromExplicitPick: req.wasExplicitPick, startedFromResume: req.wasResume,
                              onClose: { presenter.request = nil })
                     .id(req.id)   // clean player teardown per request
             }

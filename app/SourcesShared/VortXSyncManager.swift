@@ -664,12 +664,6 @@ final class VortXSyncManager: ObservableObject {
         // VERSION-WINS: once no local edit is pending, apply only a STRICTLY NEWER remote; a stale or equal pull
         // is a no-op. lastSyncedVersion is persisted (kVersionKey) so this holds across relaunches.
         if !force, pulled.version <= lastSyncedVersion { return false }
-        // `force` (manual "Sync now" / sign-in reconciliation) intentionally re-applies even a stale/equal doc
-        // for the UNION-SAFE merges (roster, settings, apiKeys): those can only ADD, never resurrect a delete.
-        // But the DESTRUCTIVE folds (delete tombstones, add-on-removal uninstalls, profileEdits) must still be
-        // version-gated even under force: a stale forced pull that predates a delete would otherwise let a
-        // resurrected old edit/delete win over a newer local state. Gate them on a strictly-newer pull only.
-        let pullIsNewer = pulled.version > lastSyncedVersion
         let doc = pulled.doc
         var restored = false
         // SUPPRESS THE OBSERVER for the whole apply region. SettingsBackup.restore + the apiKeys/overlay/
@@ -730,7 +724,7 @@ final class VortXSyncManager: ObservableObject {
         // Cross-device delete tombstones: fold any incoming doc.vortx.deletedProfiles into the local set
         // FIRST (before applying the roster below), so a profile another device deleted is dropped here
         // and the union-merge can never bring it back. mergeDeletedTombstones also prunes the live roster.
-        if pullIsNewer, let vortx = doc["vortx"] as? [String: Any], let deleted = vortx["deletedProfiles"] as? [String] {
+        if let vortx = doc["vortx"] as? [String: Any], let deleted = vortx["deletedProfiles"] as? [String] {
             if ProfileStore.shared.mergeDeletedTombstones(deleted) { restored = true }
         }
         // Cross-device add-on REMOVAL tombstones (the add-on analogue of the deletedProfiles fold above).
@@ -743,15 +737,15 @@ final class VortXSyncManager: ObservableObject {
         // the URL is already tombstoned (re-recording would be a redundant no-op). The local set is also
         // subtracted from hydrateEngineFromOwnedAddons' ownedAddons(from:), so a removed add-on is never
         // reinstalled on the next hydrate even before this uninstall runs.
-        // Fold the DOC's incoming removals only on a strictly-newer pull (see pullIsNewer above): a stale
-        // forced pull that predates a locally-restored add-on must not resurrect its old removal. The uninstall
-        // loop below still reads the durable LOCAL tombstone set, so a removal recorded on THIS device is
-        // always honored regardless of force.
+        // ALWAYS fold the incoming removals (never version-gate them): merging a removal tombstone is
+        // union-safe - it only ADDS to the durable removal set, it can never resurrect an add-on. Gating it on
+        // a "strictly newer" pull is what let a web/other-device removal be SKIPPED on an equal/forced pull, so
+        // the tombstone never merged and the roster union re-added the add-on (the WatchHub/YouTube resurrection).
         var incomingAddonRemovals: [String] = []
-        if pullIsNewer, let vortx = doc["vortx"] as? [String: Any], let removed = vortx["deletedAddons"] as? [String] {
+        if let vortx = doc["vortx"] as? [String: Any], let removed = vortx["deletedAddons"] as? [String] {
             incomingAddonRemovals += removed
         }
-        if pullIsNewer, let webRemoved = doc["webAddonRemovals"] as? [String] {   // web agent owns this write; we only READ it
+        if let webRemoved = doc["webAddonRemovals"] as? [String] {   // web agent owns this write; we only READ it
             incomingAddonRemovals += webRemoved
         }
         if AddonTombstones.merge(incomingAddonRemovals) { restored = true }
@@ -809,10 +803,9 @@ final class VortXSyncManager: ObservableObject {
         // Web-authored profile edits (vortx.tv dashboard writes doc.profileEdits, a SIBLING key the app
         // preserves via syncUp's read-merge-write, unlike doc.vortx which the app overwrites). Apply
         // name/familyEdit/pin + per-profile library adds, LWW by editedAt, once per stamp.
-        // Gated on a strictly-newer pull (pullIsNewer) as well as the per-stamp editedAt guard: a stale forced
-        // pull that predates a local change must not re-apply a resurrected old edit whose editedAt happens to
-        // exceed this device's last-applied stamp.
-        if pullIsNewer, let edits = doc["profileEdits"] as? [String: Any] {
+        // Guarded by the per-stamp editedAt LWW below (once per stamp), which is the correct conflict rule here;
+        // no extra version gate (that was reverted with the tombstone gates, since it blocked legitimate edits).
+        if let edits = doc["profileEdits"] as? [String: Any] {
             let editedAt = (edits["editedAt"] as? Double) ?? Double((edits["editedAt"] as? Int) ?? 0)
             if editedAt > lastAppliedProfileEditsAt {
                 ProfileStore.shared.applyProfileEdits(edits)

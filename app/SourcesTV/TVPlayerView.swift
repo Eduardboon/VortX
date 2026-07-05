@@ -166,6 +166,9 @@ struct TVPlayerView: View {
     /// True while the INITIAL source is a Continue-Watching resume (see startedFromResume). Cleared once the
     /// player switches to any other source, so only the first stored-link attempt gets resume-hop treatment.
     @State private var currentPlaybackIsResume = false
+    /// True once a resume has already re-selected its SAME source (re-resolved a fresh link for the same file)
+    /// after a stale-link failure, so a second failure hops to a DIFFERENT source instead of looping on it.
+    @State private var resumeSourceReresolved = false
     // First-buffer grace for a big 4K remux on slow debrid: a start-timeout that fires while bytes are
     // still arriving (the demuxer-cache edge advanced since the watchdog armed) extends the wait rather
     // than declaring the source dead. Bounded by the extension count and the overall recovery deadline.
@@ -2123,6 +2126,39 @@ struct TVPlayerView: View {
     /// A pre-playback failure (an endFileError before the first frame). Auto-retry up to `maxAutoRetries`
     /// times with a short backoff before falling back to the manual error overlay, so a transient source
     /// hiccup recovers on its own instead of dumping the viewer to an error screen.
+    /// A resume's exact stored source failed (its debrid link expired). Re-select the SAME source: mint a fresh
+    /// link for the same file via DebridCoordinator (a single requestdl / re-add, not a full source re-pick),
+    /// reset the load state, and replay it in place. Returns true once it kicks off (the caller stops); false
+    /// when there is no debrid provenance to re-resolve, so the caller falls through to the failover hop.
+    private func retryResumeSameSource() -> Bool {
+        guard let ref = debridRef, !ref.infoHash.isEmpty else { return false }
+        resumeSourceReresolved = true
+        // Fresh load state + in-place retry budget for a clean attempt at the SAME source; keep the resume offset.
+        hasStartedPlaying = false; buffering = true; appliedVolume = false; appliedResume = false
+        loadErrorMsg = ""; autoRetryCount = 0; bufferGraceUsed = 0; lastBufferedAtWatchdog = -1
+        withAnimation { reconnecting = true }
+        let resume: Double? = resumeSeconds
+        autoRetryTask?.cancel()
+        autoRetryTask = Task { @MainActor in
+            if let fresh = try? await DebridCoordinator.shared.reresolve(
+                service: ref.service, infoHash: ref.infoHash,
+                torrentId: ref.torrentId, fileId: ref.fileId, fileIdx: ref.fileIdx) {
+                DiagnosticsLog.log("player", "resume: re-selected the SAME source (fresh link) after the stored link expired")
+                reconnecting = false
+                curURL = fresh
+                resumeSeconds = resume
+                loadIntoPlayer(fresh, headers: curHeaders, live: curIsLive)
+                startLoadTimeout()
+            } else {
+                // The same source is genuinely gone (evicted / no key): now hop to a DIFFERENT source.
+                DiagnosticsLog.log("player", "resume: same source unavailable on re-resolve -> hopping to another")
+                reconnecting = false
+                if !hopToNextSource(reason: "resume source gone") { withAnimation { loadFailed = true } }
+            }
+        }
+        return true
+    }
+
     private func handleLoadFailure(_ msg: String) {
         guard !hasStartedPlaying, !loadFailed else { return }
         loadErrorMsg = msg
@@ -2147,6 +2183,11 @@ struct TVPlayerView: View {
                 withAnimation { loadFailed = true }
                 return
             }
+            // RESUME (Continue Watching): the exact source's stored link expired. Re-select the SAME source once
+            // more, minting a fresh debrid link for the same file, BEFORE hopping to a different source, so a
+            // resume stays on the source you chose. Only if that source is genuinely gone (re-resolve fails) do
+            // we fall through to the failover hop below.
+            if currentPlaybackIsResume, !resumeSourceReresolved, retryResumeSameSource() { return }
             if hopToNextSource(reason: "load failed: \(msg)") { return }
             // CW-resume of a debrid/direct stream whose stored link expired (debrid URLs are time-limited):
             // HomeView.directResume kicks off a background reload of the title's streams, but they may not
@@ -2725,6 +2766,9 @@ struct TVPlayerView: View {
         // source still fails over automatically instead of dead-ending an unattended binge on "choose another
         // source". Also refresh the first-buffer grace budget for the fresh source. Mirrors iOS goToEpisode.
         currentPickWasExplicit = false; bufferGraceUsed = 0; lastBufferedAtWatchdog = -1
+        // A new episode is NOT the launch resume (and carries its own source, not the launch debridRef), so the
+        // resume-same-source retry must not fire for it: clear both resume flags.
+        currentPlaybackIsResume = false; resumeSourceReresolved = false
         // New episode: reset the community-subtitle session (new content key + fingerprint) so pooled subs,
         // the seeded offset, and the embedded upload all re-run against the new episode (P2/P3/P4).
         subFingerprint = nil; subFingerprintKey = ""; pooledSubsKey = ""; pooledSubs = []
